@@ -162,5 +162,64 @@ class Config:
     log_every_n: int = 30
     radar_diagnostic_every_n: int = 300
 
+    # ------------------------------------------------------------------
+    # V5.1 fly-by guidance (phobos_nav/ballistic.py). guidance_mode
+    # "legacy_mpc" restores the V5.0 PredictivePlanner path unchanged.
+    guidance_mode: str = "flyby_v51"
+    v51_phobos_mu_m3_s2: float = 7.075e5          # fallback; live value read from Phobos
+    v51_phobos_rate: float = 2.2803e-4            # synchronous rotation (rad/s)
+    v51_frame_terms: bool = True                  # rotating-frame + Mars-tide terms
+    v51_launch_speed_mps: float = 7.0
+    v51_miss_m: float = 35.0                      # fly-by offset; latch at 50 m
+    v51_aim_candidates: int = 8
+    v51_aim_clearance_cap_m: float = 30.0
+    v51_launch_horizon_s: float = 300.0
+    v51_min_launch_time_s: float = 8.0
+    v51_thrust_accel_mps2: float = 0.10           # torque-balanced authority (~0.11 live)
+    v51_command_accel_mps2: float = 0.5           # any non-zero command saturates
+    v51_done_tol_mps: float = 0.004               # ~2 ticks of impulse
+    v51_first_trim_s: float = 20.0
+    v51_trim_period_s: float = 40.0
+    v51_trim_deadband_mps: float = 0.03
+    v51_trim_min_range_m: float = 150.0
+    v51_final_trim_range_m: float = 350.0
+    v51_ca_limit_m: float = 42.0                  # predicted pass beyond this -> trim
+    v51_check_period_s: float = 1.0
+    v51_check_dt_s: float = 1.0
+    v51_horizon_s: float = 90.0
+    v51_base_margin_m: float = 6.0
+    v51_margin_growth_mps: float = 0.07
+    v51_tentative_growth_mps: float = 0.8
+    v51_shuttle_radius_m: float = 3.0
+    v51_relevance_radius_m: float = 250.0
+    v51_avoid_magnitudes: tuple = (0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.2, 1.8)
+    v51_lateral_cost: float = 3.0
+    v51_speedup_cost: float = 0.8
+    v51_slowdown_cost: float = 1.5
+    v51_avoid_commit_s: float = 8.0
+    v51_tracks_ready_fraction: float = 0.9
+    v51_launch_confirmed_fraction: float = 0.95
+    v51_max_launch_wait_s: float = 30.0
+    v51_action_horizon_s: float = 90.0
+    v51_far_cost_cap: float = 1.0e9
+    v51_terminal_ranges_m: tuple = (350.0, 180.0)
+    v51_urgent_s: float = 25.0
+    v51_reaim_cost: float = 1.0
+    v51_fold_cost: float = 1.0
+    v51_terminal_zone_m: float = 400.0
+    v51_ca_min_m: float = 20.0
 
-CONFIG = Config()
+
+
+def _offline_overrides():
+    """Offline tuning only: PHOBOS_CONFIG_OVERRIDES (JSON) is never set in STPro."""
+    import json
+    import os
+    raw = os.environ.get("PHOBOS_CONFIG_OVERRIDES")
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    return {k: tuple(v) if isinstance(v, list) else v for k, v in data.items()}
+
+
+CONFIG = Config(**_offline_overrides())

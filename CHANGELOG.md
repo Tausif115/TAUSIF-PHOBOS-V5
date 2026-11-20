@@ -1,3 +1,44 @@
+# V5.1-dev — fly-by guidance (offline bench only; NOT deployed, no STPro run)
+
+## Guidance (`experimental/phobos_nav/ballistic.py`, wired in `Controller.py`)
+- Fly-by interception: success latches at 50 m (official Scoring.py); aim point
+  35 m from the target (8 alternatives), no braking before the latch.
+- Gravity-aware targeting (Phobos point mass + rotating-frame/Mars-tide terms),
+  launch at 7 m/s once >=95 % of tracks are confirmed (~11 s), burn-coast-trim:
+  command is exactly zero while coasting (official actuator fires full thrust
+  for any non-zero command); trims re-solved every 2 s, deadband 0.03 m/s,
+  mandatory terminal accuracy checks inside 400 m.
+- Predictive avoidance every 1 s: all tracks propagated under gravity for 90 s;
+  margin 6 m + 0.07 m/s x (t + age/2) (+0.8 m/s for tentative tracks); 80
+  impulse candidates; cheapest clearing one chosen (speed-up preferred,
+  lateral cost includes the return). During the launch burn: zero-cost aim
+  change first, then exact finite-burn "fold" evaluation, else interrupt the
+  burn and dodge immediately; commitment 8 s; partial returns when blocked.
+- Rollback switch: `guidance_mode = "legacy_mpc"` (V5.0 planner, unchanged).
+- Log tag PHOBOS_NAV_V51; `v51_*` log fields (phase, dv, trims, avoids, ...).
+
+## Offline mission bench (`tests/missionbench/`)
+Official Radar.py, JetSelectionActuator.py, Scoring.py, SpawnDebris.py and the
+real Controller.py run verbatim against a mock SpaceTeams API (STPro's Python
+3.12.10 / NumPy 2.5.4 / SciPy 1.18.1). SpawnDebris seeds via a controlled copy
+(seed line only); seed 100 reproduces the baked debris exactly. Modelled (no
+source): rigid-body propagation, ApplyGravity (1 Hz), collisions (no damage).
+Live V50 cross-check: fuel rate within ~7 %, NO_SAFE_HORIZON share 57 vs 58 %;
+live tracker churn NOT reproduced (live debris less predictable than modelled).
+
+## Offline results (bench predictions, not competition results)
+| scenario | runs | collision-free success | score median / mean / worst | fuel median |
+|---|---|---|---|---|
+| V5.1 nominal seeds 100,1-32 | 33 | 33 | 44.5 / 39.9 / 6.1 | 40.6 kg |
+| V5.1 live-like fast debris | 11 | 10 (pad hit at 1.6 s) | 47.5 / 46.6 / 42.6 | 38.4 kg |
+| V5.1 3 injected path threats | 11 | 11 | 29.3 / 30.0 / 20.0 | 52.3 kg |
+| V50 (ccfaf61) seeds 100, 1 | 2 | 2 | -225.4, -316.3 | 244, 309 kg |
+Min debris clearance >= 7.0 m in all non-artefact runs. Guidance compute: loop
+work p95 ~5 ms, worst tick ~70 ms (real timing, bench host).
+
+## Tests
+`tests/test_v51_guidance.py` (6). Suite: 88 passed.
+
 # V5.0-dev — Phase A (tracker retuning from live run 0555d4ef, offline)
 
 Offline-verified only. Not deployed, not run in STPro. Planner, guidance and

@@ -94,6 +94,7 @@ from phobos_nav.radar_diagnostics import format_radar_diagnostic
 from phobos_nav.tracking import DebrisTracker, StateHistory
 from phobos_nav.planning import PredictivePlanner
 from phobos_nav.scheduling import DeadlinePlanner
+from phobos_nav.ballistic import FlybyGuidance
 from phobos_nav.threats import (
     track_state_arrays,
     nearest_track_distance as nearest_track_distance_from_state,
@@ -134,6 +135,18 @@ state_history = StateHistory(
 radar_clock = RadarClockSynchronizer(CONFIG)
 planner = PredictivePlanner(CONFIG)
 deadline_planner = DeadlinePlanner(planner, CONFIG)
+
+# V5.1 fly-by guidance (gravity-aware burn-coast-trim + predictive avoidance).
+try:
+    phobos_mu = float(phobos.GetParam(
+        st.VarType.double, ["Dynamics", "GravitationalParameter_km3_s2"]
+    )) * 1.0e9
+    if not np.isfinite(phobos_mu) or phobos_mu <= 0.0:
+        raise ValueError("non-positive mu")
+except Exception:
+    phobos_mu = CONFIG.v51_phobos_mu_m3_s2
+use_flyby = CONFIG.guidance_mode == "flyby_v51"
+flyby = FlybyGuidance(CONFIG, phobos_mu)
 
 # Read-only estimate of official thruster authority from the asset path
 # configured by JetConfigName in the original competition simconf.
@@ -333,13 +346,17 @@ previous_loop_work_ms = float("nan")
 loop_overrun_count = 0
 
 
+class _FlybyHandled(Exception):
+    """Control-flow marker: the V5.1 fly-by guidance produced this tick's command."""
+
+
 def fail_closed_tick(safety_state, detail=""):
     """Send zero body-frame thrust and keep the controller alive for retry."""
     global iteration
     SetCommand(np.zeros(3, dtype=float), np.zeros(3, dtype=float))
     if iteration % CONFIG.log_every_n == 0:
         print(
-            f"PHOBOS_NAV_V50 t={t_from_start:.2f} "
+            f"PHOBOS_NAV_V51 t={t_from_start:.2f} "
             f"safety={safety_state} detail={str(detail)!r} "
             "cmd_accel_mps2=0.000",
             flush=True
@@ -503,6 +520,18 @@ while True:
         desired_approach_speed = 0.0
         nearest_track_distance = float("inf")
 
+    elif radar_error is not None and use_flyby:
+        # V5.1: stale radar never triggers braking or new decisions. Committed
+        # burns continue; retained tracks (within expiry) still guard the path.
+        track_state = track_state_arrays(tracker.tracks, t_from_start)
+        accel_phobos, planner_metrics = flyby.update(
+            t_from_start, loc, vel, target_loc, track_state,
+            radar_ok=False, tracks_ready=False, clock=time.perf_counter,
+        )
+        min_ttc_s = float("inf")
+        desired_approach_speed = 0.0
+        nearest_track_distance = float("inf")
+
     elif radar_error is not None:
         # Never continue target pursuit on stale/un-aligned radar. Remove
         # target-relative velocity using only the validated thrust model.
@@ -598,7 +627,17 @@ while True:
         # fit this tick's budget (at most one tick of deferral; immediately
         # under critical conditions). The cached command is held meanwhile.
         planner_start = time.perf_counter()
+        if use_flyby:
+            tracks_ready = (
+                len(tracks) >= CONFIG.v51_tracks_ready_fraction * max(radar_available_count, 1)
+            )
+            cached_accel_phobos, cached_planner_metrics = flyby.update(
+                t_from_start, loc, vel, target_loc, track_state,
+                radar_ok=True, tracks_ready=tracks_ready, clock=time.perf_counter,
+            )
         try:
+            if use_flyby:
+                raise _FlybyHandled()
             completed_plan = deadline_planner.tick(
                 loop_start_wall,
                 planner_due,
@@ -617,6 +656,8 @@ while True:
             )
             if completed_plan is not None:
                 cached_accel_phobos, cached_planner_metrics = completed_plan
+        except _FlybyHandled:
+            pass
         except Exception as error:
             # Do not continue blind target pursuit if the planner fails.
             deadline_planner.reset()
@@ -701,7 +742,7 @@ while True:
         )
 
         log_line = (
-            f"PHOBOS_NAV_V50 "
+            f"PHOBOS_NAV_V51 "
             f"t={t_from_start:.2f} "
             f"range_m={target_distance:.2f} "
             f"rel_speed_mps={relative_speed:.3f} "
@@ -786,6 +827,8 @@ while True:
             f"fuel_kg={fuel_used:.3f} "
             f"damage={damage:.3f}"
         )
+        if use_flyby:
+            log_line += " " + flyby.log_fields()
         if radar_error is not None:
             log_line += f" radar_error={radar_error!r}"
 

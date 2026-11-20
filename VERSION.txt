@@ -1,10 +1,10 @@
-Phobos Escape Controller V5.0-dev (Phases 0-2b committed; Phase A tracker retuning in working tree)
-Log tag: PHOBOS_NAV_V50
+Phobos Escape Controller V5.1-dev (fly-by guidance: gravity-aware burn-coast-trim + predictive avoidance)
+Log tag: PHOBOS_NAV_V51
 
-Based on: V4.3 500-debris validation candidate (../V43-BASELINE, unmodified).
-Deployed to STPro: commit ccfaf61 (Phases 0-2b) only. Phase A is NOT deployed.
-Live STPro: one 25 s run of ccfaf61 on COMPETITION_SIM_500_RADAR_VALIDATION
-(run 0555d4ef). Short-check gate A NOT passed (track age max 6.19 s; 550 cap hit
-at startup). Phase A addresses the tracker findings; offline-verified only.
-Not yet tested against FINAL_SUBMISSION.simconf (not available locally).
-Fuel, guidance, planner and actuator parameters are unchanged from V4.3.
+Based on: V4.3 500-debris validation candidate (../V43-BASELINE, unmodified),
+V5 Phases 0-2b (ccfaf61) and Phase A tracker retuning (df39ee0).
+Deployed to STPro: commit ccfaf61 (V50) only. V5.1 is NOT deployed.
+V5.1 evidence: offline mission bench only (tests/missionbench, official STU4-Sim
+scripts executed verbatim). No STPro run of V5.1 exists.
+Rollback switch: config.guidance_mode = "legacy_mpc" restores the V5.0 planner path.
+FINAL_SUBMISSION.simconf: not available locally (not yet tested against it).
