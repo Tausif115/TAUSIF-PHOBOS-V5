@@ -1,0 +1,4 @@
+Phobos Escape Controller V4.3 — 500-debris validation candidate
+
+Purpose: validate debris avoidance with all 500 spawned objects available to radar and retained by the controller tracker.
+Not a final competition release. Fuel optimization is intentionally deferred.
