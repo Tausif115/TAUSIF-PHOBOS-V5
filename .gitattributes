@@ -1,0 +1,31 @@
+# PHOBOS V5 line-ending policy.
+#
+# Goal: every clean checkout reproduces exactly the bytes recorded in
+# SHA256SUMS.txt (and the V4.3 baseline manifest), independent of the
+# user's core.autocrlf setting. Attributes override core.autocrlf.
+
+# Source, scripts and documentation: LF in the repository and in every
+# checkout. PowerShell 5.1 and Python both accept LF line endings.
+*.py            text eol=lf
+*.ps1           text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+.gitattributes  text eol=lf
+
+# Byte-exact files: never converted, stored and checked out as-is.
+# - The thruster CSV fixture must stay byte-identical to the official
+#   STU4-Sim asset (CRLF) and to the V4.3 baseline manifest.
+# - V4.3 rollback metadata is byte-identical to the V4.3 baseline copies.
+# - User-maintained files keep their exact bytes (BOM, trailing CRLF).
+# whitespace=cr-at-eol: their CR bytes are intentional, so
+# `git diff --check` must not report them as trailing whitespace.
+tests/fixtures/SpaceBuggyJetConfigNoMains.csv  -text whitespace=cr-at-eol
+V4_3_BACKUP_PATH.txt                           -text whitespace=cr-at-eol
+V4_3_BACKUP_HAD_PACKAGE.txt                    -text whitespace=cr-at-eol
+CLAUDE.md                                      -text whitespace=cr-at-eol
+.gitignore                                     -text whitespace=cr-at-eol
+
+# Anything else (binary or unknown): no conversion.
+*.csv           -text whitespace=cr-at-eol
+*.zip           binary
+*.7z            binary

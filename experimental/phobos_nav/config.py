@@ -28,14 +28,53 @@ class Config:
     # 500 records at the current 120 Hz radar loop are refreshed round-robin
     # (one object per loop, full cycle about 4.17 s); allow timing margin.
     track_max_age_s: float = 6.0
+    # V5: the offset is locked after this many publication samples. Both
+    # clocks derive from SimClock, so the true offset is a per-run constant.
+    radar_sync_lock_samples: int = 9
+    # Acquisition samples more than this above the minimum are loop overruns
+    # (legitimate read-delay spread is about one controller period).
+    radar_sync_outlier_window_s: float = 0.05
+    radar_resync_threshold_s: float = 0.25
+    radar_resync_consecutive: int = 3
+    # Coarse (Euclidean) association prefilter; the statistical gate below
+    # makes the final decision.
     association_gate_m: float = 25.0
     association_speed_gate_mps: float = 10.0
     diameter_gate_min_m: float = 2.0
     diameter_gate_fraction: float = 0.50
-    alpha: float = 0.70
-    beta: float = 0.18
+    # V5 constant-velocity Kalman tracker. Gate: chi-square, 4 dof
+    # (3 position + 1 range-rate), p ~= 1e-4.
+    association_chi2_gate: float = 23.5
+    # Radar.py range-rate sigma is 0.02 m/s; 0.05 adds line-of-sight
+    # direction error. A further geometric term is added per update.
+    radar_range_rate_sigma_mps: float = 0.05
+    radar_measurement_extra_sigma_m: float = 0.5
+    # Unmodelled debris acceleration in the rotating Phobos frame (gravity
+    # ~5e-3, Coriolis/centrifugal ~2e-3 m/s^2) as white-noise PSD (m^2/s^3).
+    track_process_accel_psd: float = 1.0e-3
+    # Prior on the unobserved tangential absolute debris velocity at track
+    # birth (observed Phobos-frame debris speeds are ~0.7-5 m/s).
+    track_initial_tangential_velocity_sigma_mps: float = 5.0
+    # Radar.py refreshes each object once per NumDebris loop iterations
+    # (1.67 s at 200, 4.17 s at 500, 120 Hz). Two genuine measurements of one
+    # object can never be closer than this; anything closer is a cached copy
+    # or a mis-association and must not update a track.
+    track_min_update_interval_s: float = 0.25
+    # Track expiry follows the measured per-object revisit period:
+    # max(track_max_age_s, factor * median revisit), capped.
+    track_revisit_expiry_factor: float = 1.3
+    track_revisit_min_samples: int = 50
+    track_max_age_cap_s: float = 9.0
+    # An unassociated observation may re-acquire an overdue track (one that
+    # missed its expected revisit) instead of spawning a duplicate.
+    track_reacquire_min_fraction: float = 0.75
+    radar_seen_key_retention_s: float = 15.0
+    alpha: float = 0.70  # legacy (V4.3 alpha-beta); unused by the V5 tracker
+    beta: float = 0.18  # legacy (V4.3 alpha-beta); unused by the V5 tracker
     confirmation_hits: int = 3
-    max_track_speed_mps: float = 100.0
+    # Physical bound on absolute debris speed in the Phobos frame (observed
+    # <= ~5 m/s); V4.3 used 100 m/s, which permitted corrupted velocities.
+    max_track_speed_mps: float = 15.0
     future_timestamp_tolerance_s: float = 0.25
     min_measurement_dt_s: float = 0.005
     # Must be >= spawned debris count so the tracker does not evict valid objects.

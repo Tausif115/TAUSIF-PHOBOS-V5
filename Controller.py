@@ -379,7 +379,7 @@ def fail_closed_tick(safety_state, detail=""):
     SetCommand(np.zeros(3, dtype=float), np.zeros(3, dtype=float))
     if iteration % CONFIG.log_every_n == 0:
         print(
-            f"PHOBOS_NAV_V43 t={t_from_start:.2f} "
+            f"PHOBOS_NAV_V50 t={t_from_start:.2f} "
             f"safety={safety_state} detail={str(detail)!r} "
             "cmd_accel_mps2=0.000",
             flush=True
@@ -714,7 +714,7 @@ while True:
         )
 
         log_line = (
-            f"PHOBOS_NAV_V43 "
+            f"PHOBOS_NAV_V50 "
             f"t={t_from_start:.2f} "
             f"range_m={target_distance:.2f} "
             f"rel_speed_mps={relative_speed:.3f} "
@@ -736,6 +736,8 @@ while True:
             f"authority_residual={authority_residual:.3g} "
             f"radar_clock_ready={int(radar_clock_ready)} "
             f"radar_clock_offset_s={radar_clock_offset_s:.3f} "
+            f"radar_clock_locked={int(radar_clock.locked)} "
+            f"radar_clock_resyncs={radar_clock.resync_count} "
             f"radar_latest_age_s={radar_latest_age_s:.3f} "
             f"radar_available={radar_available_count} "
             f"radar_read={len(raw_debris)} "
@@ -751,6 +753,16 @@ while True:
             f"duplicates={tracker.last_update_stats.get('duplicates', 0)} "
             f"stale={tracker.last_update_stats.get('stale', 0)} "
             f"invalid={tracker.last_update_stats.get('invalid', 0)} "
+            f"too_soon={tracker.last_update_stats.get('too_soon', 0)} "
+            f"reacquired_total={tracker.cumulative['reacquired']} "
+            f"evicted_total={tracker.cumulative['evicted']} "
+            f"evicted_confirmed_total={tracker.cumulative['evicted_confirmed']} "
+            f"expired_total={tracker.cumulative['expired']} "
+            f"replays_total={tracker.cumulative['replays']} "
+            f"velocity_clamped_total={tracker.cumulative['velocity_clamped']} "
+            f"track_ids_issued={tracker.next_identifier - 1} "
+            f"revisit_s={tracker.last_update_stats.get('revisit_s', float('nan')):.3f} "
+            f"track_expiry_s={tracker.last_update_stats.get('expiry_s', float('nan')):.3f} "
             f"min_ttc_s={min_ttc_s:.2f} "
             f"nearest_track_m={nearest_track_distance:.2f} "
             f"planner={planner.last_choice} "

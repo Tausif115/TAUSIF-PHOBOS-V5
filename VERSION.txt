@@ -1,4 +1,6 @@
-Phobos Escape Controller V4.3 — 500-debris validation candidate
+Phobos Escape Controller V5.0-dev (Phases 0-1: deployment safety, radar/tracker integrity)
+Log tag: PHOBOS_NAV_V50
 
-Purpose: validate debris avoidance with all 500 spawned objects available to radar and retained by the controller tracker.
-Not a final competition release. Fuel optimization is intentionally deferred.
+Based on: V4.3 500-debris validation candidate (../V43-BASELINE, unmodified).
+Status: offline tests only. NOT deployed. Live STPro validation NOT YET PERFORMED.
+Fuel, guidance, planner and actuator parameters are unchanged from V4.3.

@@ -15,27 +15,67 @@ class RadarObservation:
     closest_point: float = float("nan")
     relative_position: np.ndarray | None = None
     shuttle_velocity: np.ndarray | None = None
+    # Immutable identity of the published radar record: the exact raw floats
+    # of rows 0-1 and the raw radar-process timestamp. Radar.py republishes
+    # unchanged (cached) records bit-for-bit, so this key identifies a cached
+    # copy independently of the controller's clock-offset estimate.
+    raw_key: bytes | None = None
+    raw_timestamp: float | None = None
+    # Position-measurement variances after range fusion: cross-range (per
+    # axis) and along the line of sight. The tracker builds the 3x3
+    # covariance only for genuinely new records (decode cost stays low).
+    measurement_cross_variance: float = float("nan")
+    measurement_radial_variance: float = float("nan")
+    # Optional explicit 3x3 covariance (overrides the two variances).
+    measurement_covariance: np.ndarray | None = None
+
+
+def raw_record_key(matrix):
+    """Exact identity of one published Radar.py 3x3 record.
+
+    The raw float64 bytes of the whole record: cached copies republished by
+    Radar.py are bit-identical; any genuinely new measurement differs (new
+    timestamp and new noise).
+    """
+    return np.ascontiguousarray(matrix, dtype=float).tobytes()
 
 
 class RadarClockSynchronizer:
-    """Estimate the radar-process epoch offset from the newest radar record.
+    """Estimate, then lock, the radar-process epoch offset.
 
-    Radar.py timestamps measurements from its own process-start time. The
-    controller timestamps its state history from simulation StartDateTAI.
-    These clocks are not guaranteed to share an epoch. The radar array is
-    sorted/published periodically; the newest record therefore provides a
-    repeatable clock-offset observation.
+    Official Radar.py (lines 117, 144-148) stamps each record with
+    SimClock time since its own loop start; the controller uses SimClock
+    time since StartDateTAI. Both derive from the same SimClock, so the true
+    offset is a per-run constant. Each new publication provides a sample
+    ``now - newest_raw_time = offset + read_delay`` with read_delay >= 0.
+
+    During acquisition the offset is the median of samples less half a
+    nominal poll period (unchanged V4.3 model). After
+    ``radar_sync_lock_samples`` samples the offset is LOCKED: read-delay
+    jitter and loop overruns no longer move it. It is re-acquired only on a
+    radar timebase reset or a persistent offset jump larger than
+    ``radar_resync_threshold_s`` (for example a radar process restart).
     """
 
     def __init__(self, config):
         self.config = config
         self.offset_samples = deque(maxlen=int(config.radar_sync_window))
+        self.lock_samples = int(getattr(config, "radar_sync_lock_samples", 9))
+        self.resync_threshold_s = float(
+            getattr(config, "radar_resync_threshold_s", 0.25)
+        )
+        self.resync_consecutive = int(
+            getattr(config, "radar_resync_consecutive", 3)
+        )
         self.offset_s = 0.0
         self.last_raw_max_s = None
         self.last_controller_time_s = None
         self.latest_age_s = float("inf")
         self.sample_count = 0
         self.ready = False
+        self.locked = False
+        self.resync_count = 0
+        self._outlier_run = 0
 
     @staticmethod
     def _max_timestamp(raw_data):
@@ -59,6 +99,8 @@ class RadarClockSynchronizer:
         self.latest_age_s = float("inf")
         self.sample_count = 0
         self.ready = False
+        self.locked = False
+        self._outlier_run = 0
 
     def update(self, raw_data, controller_time_s):
         now = float(controller_time_s)
@@ -96,12 +138,32 @@ class RadarClockSynchronizer:
                 float(self.config.radar_controller_poll_hz), 1.0
             )
             offset_sample = now - raw_max - poll_delay
-            if np.isfinite(offset_sample):
+            if np.isfinite(offset_sample) and self.locked:
+                # Locked: a constant offset is physically expected. Only a
+                # persistent large jump (timebase change) triggers re-acquisition.
+                if abs(offset_sample - self.offset_s) > self.resync_threshold_s:
+                    self._outlier_run += 1
+                    if self._outlier_run >= self.resync_consecutive:
+                        self.resync_count += 1
+                        self.offset_samples.clear()
+                        self.locked = False
+                        self._outlier_run = 0
+                else:
+                    self._outlier_run = 0
+            if np.isfinite(offset_sample) and not self.locked:
                 self.offset_samples.append(float(offset_sample))
                 self.sample_count += 1
-                self.offset_s = float(np.median(
-                    np.asarray(self.offset_samples, dtype=float)
+                # Read delay is one-sided: a sample far above the smallest one
+                # comes from a controller loop overrun, not from the clock.
+                samples = np.asarray(self.offset_samples, dtype=float)
+                window = float(getattr(
+                    self.config, "radar_sync_outlier_window_s", 0.05
                 ))
+                samples = samples[samples <= float(np.min(samples)) + window]
+                self.offset_s = float(np.median(samples))
+                if len(self.offset_samples) >= self.lock_samples:
+                    self.locked = True
+                    self._outlier_run = 0
 
         self.last_raw_max_s = raw_max
         self.last_controller_time_s = now
@@ -157,6 +219,13 @@ def decode_radar(
             range_rate = float(matrix[1, 1])
             diameter = float(matrix[1, 2])
             raw_measurement_time = float(matrix[2, 0])
+            record_key = raw_record_key(matrix)
+            # Without fusion, each axis carries the radar's isotropic noise.
+            cross_variance = (
+                float(config.radar_position_sigma_m) ** 2
+                if config is not None else float("nan")
+            )
+            radial_variance = cross_variance
 
             measured_center_range = norm(relative_position)
             if measured_center_range < 1.0e-9:
@@ -206,6 +275,9 @@ def decode_radar(
                         relative_position
                         * (fused_range / measured_center_range)
                     )
+                    radial_variance = 1.0 / (
+                        1.0 / variance_position + 1.0 / variance_surface
+                    )
             if (
                 not np.isfinite(raw_measurement_time)
                 or raw_measurement_time < 0.0
@@ -239,6 +311,10 @@ def decode_radar(
                     closest_point=closest_point,
                     relative_position=relative_position.copy(),
                     shuttle_velocity=vec3(shuttle_velocity_at_obs).copy(),
+                    raw_key=record_key,
+                    raw_timestamp=raw_measurement_time,
+                    measurement_cross_variance=cross_variance,
+                    measurement_radial_variance=radial_variance,
                 )
             )
         except (ValueError, TypeError, IndexError, AttributeError):

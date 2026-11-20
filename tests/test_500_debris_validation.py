@@ -31,15 +31,33 @@ def _make_observation(position, velocity, timestamp, diameter):
     )
 
 
-def test_validation_simconf_radar_and_spawner_both_use_500():
-    repo_root = ROOT.parent
-    simconf = (
-        repo_root
-        / "STU4-Sim"
-        / "Sims"
-        / "COMPETITION_SIM_500_RADAR_VALIDATION.simconf"
+SIMCONF_RELATIVE = Path("STU4-Sim") / "Sims" / "COMPETITION_SIM_500_RADAR_VALIDATION.simconf"
+
+
+def find_validation_simconf():
+    """Locate the read-only validation simconf in any supported layout.
+
+    V5 layout:        V5-DEVELOPMENT/_reference/STU4-Sim/Sims/...
+    Baseline layout:  V43-BASELINE/STU4-Sim/Sims/... (sibling of V5-DEVELOPMENT)
+    V4.3 package:     <package parent>/STU4-Sim/Sims/...
+    """
+    candidates = [
+        ROOT / "_reference" / SIMCONF_RELATIVE,
+        ROOT.parent / SIMCONF_RELATIVE,
+        ROOT.parent / "V43-BASELINE" / SIMCONF_RELATIVE,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "COMPETITION_SIM_500_RADAR_VALIDATION.simconf not found; searched: "
+        + ", ".join(str(item) for item in candidates)
     )
-    data = json.loads(simconf.read_text(encoding="utf-8"))
+
+
+def test_validation_simconf_radar_and_spawner_both_use_500():
+    simconf = find_validation_simconf()
+    data = json.loads(simconf.read_text(encoding="utf-8-sig"))
     systems = {
         item["Nametag"]: item["Inst_Parameters"]
         for item in data["SystemManager"]["Systems"]
