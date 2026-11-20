@@ -93,6 +93,12 @@ from phobos_nav.radar import RadarClockSynchronizer, decode_radar
 from phobos_nav.radar_diagnostics import format_radar_diagnostic
 from phobos_nav.tracking import DebrisTracker, StateHistory
 from phobos_nav.planning import PredictivePlanner
+from phobos_nav.scheduling import DeadlinePlanner
+from phobos_nav.threats import (
+    track_state_arrays,
+    nearest_track_distance as nearest_track_distance_from_state,
+    threat_ttc_seconds as threat_ttc_seconds_from_state,
+)
 from phobos_nav.actuator_model import (
     read_thruster_csv,
     build_activity_matrix,
@@ -127,6 +133,7 @@ state_history = StateHistory(
 )
 radar_clock = RadarClockSynchronizer(CONFIG)
 planner = PredictivePlanner(CONFIG)
+deadline_planner = DeadlinePlanner(planner, CONFIG)
 
 # Read-only estimate of official thruster authority from the asset path
 # configured by JetConfigName in the original competition simconf.
@@ -297,60 +304,8 @@ def get_frame_rotation():
     return rotation
 
 
-def threat_ttc_seconds(tracks, shuttle_position, shuttle_velocity, timestamp):
-    """Earliest predicted CPA time that enters the uncertainty-expanded warning envelope."""
-    best_ttc = float("inf")
-    for track in tracks:
-        try:
-            age = max(0.0, float(timestamp) - float(track.timestamp))
-            relative_position = (
-                np.asarray(track.position_at(timestamp), dtype=float)
-                - shuttle_position
-            )
-            relative_velocity = (
-                np.asarray(track.velocity, dtype=float)
-                - shuttle_velocity
-            )
-            speed_squared = float(np.dot(
-                relative_velocity, relative_velocity
-            ))
-            if speed_squared <= 1.0e-9:
-                continue
-            t_cpa = -float(np.dot(
-                relative_position, relative_velocity
-            )) / speed_squared
-            if t_cpa < 0.0 or t_cpa > CONFIG.horizon_s:
-                continue
-            separation = float(np.linalg.norm(
-                relative_position + relative_velocity * t_cpa
-            ))
-            tentative = not bool(getattr(track, "confirmed", False))
-            total_age = age + t_cpa
-            velocity_uncertainty = (
-                CONFIG.tentative_velocity_uncertainty_mps
-                if tentative
-                else CONFIG.confirmed_velocity_uncertainty_mps
-            )
-            envelope = (
-                CONFIG.shuttle_radius_m
-                + 0.5 * float(track.diameter)
-                + CONFIG.clearance_margin_m
-                + CONFIG.initial_uncertainty_m
-                + (CONFIG.new_track_uncertainty_m if tentative else 0.0)
-                + CONFIG.uncertainty_growth_mps * total_age
-                + 0.5 * CONFIG.uncertainty_accel_mps2 * total_age ** 2
-                + velocity_uncertainty * total_age
-            )
-            warning_radius = (
-                envelope
-                + CONFIG.replan_buffer_m
-                + CONFIG.ttc_early_warning_margin_m
-            )
-            if separation <= warning_radius:
-                best_ttc = min(best_ttc, t_cpa)
-        except (ValueError, TypeError, AttributeError):
-            continue
-    return best_ttc
+# V5 Phase 2: the per-track threat loops (V4.3 threat_ttc_seconds and the
+# nearest-track generator) are vectorized in phobos_nav/threats.py.
 
 
 iteration = 0
@@ -371,6 +326,11 @@ previous_velocity_for_diagnostics = None
 previous_velocity_time = None
 measured_accel_vector_phobos = np.full(3, np.nan, dtype=float)
 measured_accel_norm_mps2 = float("nan")
+# V5 Phase 2 loop-deadline telemetry (logging only).
+previous_loop_start_wall = None
+loop_interval_ms = float("nan")
+previous_loop_work_ms = float("nan")
+loop_overrun_count = 0
 
 
 def fail_closed_tick(safety_state, detail=""):
@@ -394,6 +354,9 @@ def fail_closed_tick(safety_state, detail=""):
 
 while True:
     loop_start_wall = time.perf_counter()
+    if previous_loop_start_wall is not None:
+        loop_interval_ms = 1000.0 * (loop_start_wall - previous_loop_start_wall)
+    previous_loop_start_wall = loop_start_wall
     t_now = st.SimGlobals.SimClock.GetTimeNow().as_datetime()
     t_from_start = (t_now - t0).total_seconds()
 
@@ -468,10 +431,12 @@ while True:
     radar_error = None
     raw_debris = []
     observations = []
+    cached_record_count = 0
     radar_available_count = 0
     radar_clock_offset_s = radar_clock.offset_s
     radar_latest_age_s = float("inf")
     radar_clock_ready = False
+    radar_start_wall = time.perf_counter()
 
     try:
         # Use the documented competitor helper; it reads only the on-board
@@ -485,8 +450,15 @@ while True:
         if not radar_clock_ready:
             radar_error = "RADAR_CLOCK_SYNC_OR_STALE"
         else:
+            # V5 Phase 2: decode only records not already processed. Cached
+            # copies (about 9/10 of every publication) are recognised by
+            # their raw bytes and skipped before decoding.
+            new_records, cached_record_count = tracker.select_new_records(
+                raw_debris, t_from_start,
+                limit=CONFIG.radar_max_new_records_per_tick,
+            )
             observations = decode_radar(
-                raw_debris,
+                new_records,
                 loc,
                 shuttle_velocity=vel,
                 current_timestamp=t_from_start,
@@ -498,11 +470,17 @@ while True:
                 observations,
                 t_from_start,
                 loc,
-                vel
+                vel,
+                prefiltered_duplicates=cached_record_count,
             )
     except Exception as error:
         radar_error = f"RADAR_READ_ERROR:{error}"
         tracks = tracker.tracks
+    # Records decoded validly this poll plus valid records decoded earlier
+    # and still present (same meaning as the V4.3 radar_decoded field).
+    radar_decoded_count = len(observations) + cached_record_count
+    radar_ms = 1000.0 * (time.perf_counter() - radar_start_wall)
+    threat_ms = 0.0
 
     # Authority is required before issuing a translation command. If the
     # official actuator has not published its read-only jet records yet,
@@ -547,18 +525,17 @@ while True:
         nearest_track_distance = float("inf")
 
     else:
-        nearest_track_distance = min(
-            (
-                float(np.linalg.norm(
-                    track.position_at(t_from_start) - loc
-                ))
-                for track in tracks
-            ),
-            default=float("inf")
+        # V5 Phase 2: one vectorized pass over all retained tracks replaces
+        # two per-track Python loops (same mathematics; equivalence-tested).
+        threat_start_wall = time.perf_counter()
+        track_state = track_state_arrays(tracks, t_from_start)
+        nearest_track_distance = nearest_track_distance_from_state(
+            track_state, loc
         )
-        min_ttc_s = threat_ttc_seconds(
-            tracks, loc, vel, t_from_start
+        min_ttc_s = threat_ttc_seconds_from_state(
+            track_state, loc, vel, CONFIG
         )
+        threat_ms = 1000.0 * (time.perf_counter() - threat_start_wall)
 
         # The speed profile must not assume braking authority equals forward
         # authority. The installed jet geometry is asymmetric, so use the
@@ -592,12 +569,13 @@ while True:
             cached_planner_metrics.get("emergency", False)
         )
 
-        if (
+        planning_critical = bool(
             cached_emergency
             or cached_clearance <= CONFIG.minimum_safe_clearance_m + 2.0
             or min_ttc_s <= CONFIG.critical_replan_ttc_s
             or nearest_track_distance <= CONFIG.critical_replan_distance_m
-        ):
+        )
+        if planning_critical:
             planner_due = (
                 iteration % CONFIG.critical_replan_every_n == 0
             )
@@ -615,41 +593,50 @@ while True:
                 iteration % CONFIG.planner_update_every_n == 0
             )
 
-        if planner_due:
-            planner_start = time.perf_counter()
-            try:
-                cached_accel_phobos, cached_planner_metrics = planner.plan(
-                    loc,
-                    vel,
-                    target_loc,
-                    target_vel,
-                    tracks,
-                    t_from_start,
+        # V5 Phase 2b: deadline-aware two-stage planning (phobos_nav/
+        # scheduling.py). A due plan is latched and its stages run when they
+        # fit this tick's budget (at most one tick of deferral; immediately
+        # under critical conditions). The cached command is held meanwhile.
+        planner_start = time.perf_counter()
+        try:
+            completed_plan = deadline_planner.tick(
+                loop_start_wall,
+                planner_due,
+                planning_critical,
+                t_from_start,
+                lambda: dict(
+                    position=loc,
+                    velocity=vel,
+                    target_position=target_loc,
+                    target_velocity=target_vel,
+                    tracks=tracks,
+                    timestamp=t_from_start,
                     max_accel=guidance_accel,
                     acceleration_limiter=limit_accel_phobos,
-                )
-                cached_planner_metrics["planner_compute_ms"] = (
+                ),
+            )
+            if completed_plan is not None:
+                cached_accel_phobos, cached_planner_metrics = completed_plan
+        except Exception as error:
+            # Do not continue blind target pursuit if the planner fails.
+            deadline_planner.reset()
+            cached_accel_phobos = limit_accel_phobos(target_vel - vel)
+            cached_planner_metrics = {
+                "risk": float("inf"),
+                "distance": target_distance,
+                "clearance": float("-inf"),
+                "emergency": True,
+                "safety_state": "PLANNER_ERROR",
+                "planner_error": str(error),
+                "candidate_count": 0,
+                "safe_candidate_count": 0,
+                "preferred_candidate_count": 0,
+                "closest_track_id": -1,
+                "planning_track_count": len(tracks),
+                "planner_compute_ms": (
                     1000.0 * (time.perf_counter() - planner_start)
-                )
-            except Exception as error:
-                # Do not continue blind target pursuit if the planner fails.
-                cached_accel_phobos = limit_accel_phobos(target_vel - vel)
-                cached_planner_metrics = {
-                    "risk": float("inf"),
-                    "distance": target_distance,
-                    "clearance": float("-inf"),
-                    "emergency": True,
-                    "safety_state": "PLANNER_ERROR",
-                    "planner_error": str(error),
-                    "candidate_count": 0,
-                    "safe_candidate_count": 0,
-                    "preferred_candidate_count": 0,
-                    "closest_track_id": -1,
-                    "planning_track_count": len(tracks),
-                    "planner_compute_ms": (
-                        1000.0 * (time.perf_counter() - planner_start)
-                    ),
-                }
+                ),
+            }
 
         accel_phobos = cached_accel_phobos.copy()
         planner_metrics = cached_planner_metrics
@@ -741,7 +728,9 @@ while True:
             f"radar_latest_age_s={radar_latest_age_s:.3f} "
             f"radar_available={radar_available_count} "
             f"radar_read={len(raw_debris)} "
-            f"radar_decoded={len(observations)} "
+            f"radar_decoded={radar_decoded_count} "
+            f"radar_new_decoded={len(observations)} "
+            f"radar_deferred_new={tracker.deferred_new_records} "
             f"fresh={tracker.last_update_stats.get('fresh', 0)} "
             f"tracks={len(tracker.tracks)} "
             f"track_age_max_s={track_age_max_s:.3f} "
@@ -782,6 +771,17 @@ while True:
             f"emergency_clearance_margin_m={planner_metrics.get('emergency_clearance_margin_m', float('nan')):.2f} "
             f"avoidance_active={int(bool(planner_metrics.get('avoidance_active', False)))} "
             f"planner_compute_ms={planner_metrics.get('planner_compute_ms', 0.0):.2f} "
+            f"radar_ms={radar_ms:.2f} "
+            f"threat_ms={threat_ms:.2f} "
+            f"loop_interval_ms={loop_interval_ms:.1f} "
+            f"prev_loop_work_ms={previous_loop_work_ms:.1f} "
+            f"loop_overruns_total={loop_overrun_count} "
+            f"plan_stage1_ms={deadline_planner.stats['stage1_ms']:.2f} "
+            f"plan_stage2_ms={deadline_planner.stats['stage2_ms']:.2f} "
+            f"plans_completed_total={deadline_planner.stats['completed']} "
+            f"plan_deferrals_total={deadline_planner.stats['deferred']} "
+            f"plan_forced_total={deadline_planner.stats['forced']} "
+            f"plan_discarded_total={deadline_planner.stats['discarded']} "
             f"fuel_kg={fuel_used:.3f} "
             f"damage={damage:.3f}"
         )
@@ -848,9 +848,11 @@ while True:
         )
 
     iteration += 1
-    remaining_sleep = loop_period_s - (
-        time.perf_counter() - loop_start_wall
-    )
+    loop_work_s = time.perf_counter() - loop_start_wall
+    previous_loop_work_ms = 1000.0 * loop_work_s
+    if loop_work_s > loop_period_s:
+        loop_overrun_count += 1
+    remaining_sleep = loop_period_s - loop_work_s
     if remaining_sleep > 0.0:
         time.sleep(remaining_sleep)
 

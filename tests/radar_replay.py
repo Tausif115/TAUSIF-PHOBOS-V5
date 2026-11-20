@@ -49,6 +49,9 @@ class ReplayScenario:
     shuttle_max_speed_mps: float = 8.0
     shuttle_direction: tuple = (-0.15, 0.02, -0.99)
     debris_speed_range_mps: tuple = (0.5, 4.0)
+    # Debris field around the initial path: lateral half-extent and z range.
+    field_half_extent_m: float = 350.0
+    field_z_range_m: tuple = (-700.0, 300.0)
 
 
 class ReplayWorld:
@@ -58,10 +61,11 @@ class ReplayWorld:
         n = scenario.num_debris
         # Debris field around the shuttle's initial path (similar extent to
         # SpawnDebris Spread_m = [300, 300, 500] around an offset point).
+        half = scenario.field_half_extent_m
         self.p0 = np.column_stack((
-            rng.uniform(-350.0, 350.0, n),
-            rng.uniform(-350.0, 350.0, n),
-            rng.uniform(-700.0, 300.0, n),
+            rng.uniform(-half, half, n),
+            rng.uniform(-half, half, n),
+            rng.uniform(*scenario.field_z_range_m, n),
         ))
         direction = rng.normal(size=(n, 3))
         direction /= np.linalg.norm(direction, axis=1)[:, None]
@@ -141,8 +145,13 @@ def generate_publications(world):
     return publications
 
 
-def run_replay(scenario, modules, evaluate_every_s=1.0):
-    """Drive the injected phobos_nav modules with the replayed radar feed."""
+def run_replay(scenario, modules, evaluate_every_s=1.0, prefilter=True, new_record_limit=None):
+    """Drive the injected phobos_nav modules with the replayed radar feed.
+
+    prefilter=True mirrors the V5 Phase 2 Controller flow (decode only
+    records not yet seen); False decodes every record (Phase 1 flow).
+    Trackers without select_new_records (V4.3) always use the old flow.
+    """
     world = ReplayWorld(scenario)
     publications = generate_publications(world)
     publish_times = np.asarray([p[0] for p in publications])
@@ -170,12 +179,19 @@ def run_replay(scenario, modules, evaluate_every_s=1.0):
             decode_ms = tracker_ms = 0.0
             if ready:
                 start = time.perf_counter()
+                cached = 0
+                records = raw
+                if prefilter and hasattr(tracker, "select_new_records"):
+                    records, cached = tracker.select_new_records(raw, t, limit=new_record_limit)
                 observations = decode(
-                    raw, loc, shuttle_velocity=vel, current_timestamp=t,
+                    records, loc, shuttle_velocity=vel, current_timestamp=t,
                     state_history=history, radar_time_offset_s=offset, config=cfg,
                 )
                 middle = time.perf_counter()
-                tracker.update(observations, t, loc, vel)
+                if cached:
+                    tracker.update(observations, t, loc, vel, prefiltered_duplicates=cached)
+                else:
+                    tracker.update(observations, t, loc, vel)
                 decode_ms = 1000.0 * (middle - start)
                 tracker_ms = 1000.0 * (time.perf_counter() - middle)
                 stats = dict(tracker.last_update_stats)

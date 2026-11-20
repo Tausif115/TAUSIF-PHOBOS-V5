@@ -79,6 +79,16 @@ class RadarClockSynchronizer:
 
     @staticmethod
     def _max_timestamp(raw_data):
+        # V5 Phase 2: vectorized fast path for a well-formed (N,3,3) array;
+        # the per-record loop below remains the exact fallback.
+        try:
+            stacked = np.asarray(raw_data, dtype=float)
+            if stacked.ndim == 3 and stacked.shape[1:] == (3, 3) and stacked.shape[0] > 0:
+                values = stacked[:, 2, 0]
+                values = values[np.isfinite(values) & (values >= 0.0)]
+                return float(np.max(values)) if values.size else None
+        except (TypeError, ValueError):
+            pass
         values = []
         for item in raw_data:
             try:

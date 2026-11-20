@@ -4,6 +4,7 @@ import numpy as np
 
 from .geometry import norm, unit, limit_norm, perpendicular_basis
 from .guidance import approach_speed, desired_target_velocity
+from .threats import track_state_arrays
 
 
 def collision_envelope_radius(
@@ -57,6 +58,12 @@ class PredictivePlanner:
         self._clear_cycles = 0
 
     def _prepare_track_arrays(self, tracks, position, velocity, timestamp):
+        """Shortlist the max_planning_tracks lowest predicted-CPA-clearance tracks.
+
+        V5 Phase 2: vectorized over all retained tracks (was a per-track
+        Python loop). Mathematics, usability criteria and the stable
+        clearance ordering are unchanged (see equivalence tests).
+        """
         if not tracks:
             return None
 
@@ -64,93 +71,48 @@ class PredictivePlanner:
         horizon = float(cfg.horizon_s)
         shuttle_position = np.asarray(position, dtype=float).reshape(3)
         shuttle_velocity = np.asarray(velocity, dtype=float).reshape(3)
-        usable = []
-
-        for track in tracks:
-            try:
-                track_time = float(track.timestamp)
-                age = max(0.0, float(timestamp) - track_time)
-                track_position = np.asarray(
-                    track.position_at(timestamp)
-                    if hasattr(track, "position_at")
-                    else np.asarray(track.position, dtype=float)
-                    + np.asarray(track.velocity, dtype=float)
-                    * (float(timestamp) - track_time),
-                    dtype=float,
-                ).reshape(3)
-                track_velocity = np.asarray(
-                    track.velocity, dtype=float
-                ).reshape(3)
-                diameter = float(track.diameter)
-                if not (
-                    np.all(np.isfinite(track_position))
-                    and np.all(np.isfinite(track_velocity))
-                    and np.isfinite(age)
-                    and np.isfinite(diameter)
-                    and diameter >= 0.0
-                ):
-                    continue
-
-                confirmed = bool(getattr(
-                    track, "confirmed", getattr(track, "hits", 0) >= 3
-                ))
-                relative_position = track_position - shuttle_position
-                relative_velocity = track_velocity - shuttle_velocity
-                speed_squared = float(np.dot(
-                    relative_velocity, relative_velocity
-                ))
-                if speed_squared <= 1.0e-9:
-                    raw_t_cpa = float("inf")
-                    t_cpa = 0.0
-                else:
-                    raw_t_cpa = -float(np.dot(
-                        relative_position, relative_velocity
-                    )) / speed_squared
-                    t_cpa = float(np.clip(raw_t_cpa, 0.0, horizon))
-                approaching = bool(
-                    np.isfinite(raw_t_cpa) and raw_t_cpa >= 0.0
-                )
-                cpa_vector = relative_position + relative_velocity * t_cpa
-                cpa_distance = norm(cpa_vector)
-                envelope = float(collision_envelope_radius(
-                    cfg, diameter, age, t_cpa, tentative=not confirmed
-                ))
-                usable.append({
-                    "position": track_position,
-                    "velocity": track_velocity,
-                    "age": age,
-                    "diameter": diameter,
-                    "tentative": not confirmed,
-                    "identifier": int(getattr(track, "identifier", -1)),
-                    "cpa_time": t_cpa,
-                    "cpa_vector": cpa_vector,
-                    "cpa_clearance": cpa_distance - envelope,
-                    "approaching": approaching,
-                    "relative_position": relative_position,
-                    "relative_velocity": relative_velocity,
-                })
-            except (TypeError, ValueError, AttributeError, OverflowError):
-                continue
-
-        if not usable:
+        state = track_state_arrays(tracks, float(timestamp))
+        if len(state) == 0:
             return None
 
-        # Rank by predicted CPA clearance, not instantaneous range.
-        usable.sort(key=lambda item: item["cpa_clearance"])
-        usable = usable[:max(1, int(cfg.max_planning_tracks))]
+        tentative = ~state.confirmed_or_hits
+        relative_position = state.positions - shuttle_position[None, :]
+        relative_velocity = state.velocities - shuttle_velocity[None, :]
+        speed_squared = np.einsum("ij,ij->i", relative_velocity, relative_velocity)
+        moving = speed_squared > 1.0e-9
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw_t_cpa = np.where(
+                moving,
+                -np.einsum("ij,ij->i", relative_position, relative_velocity)
+                / np.where(moving, speed_squared, 1.0),
+                np.inf,
+            )
+        t_cpa = np.where(moving, np.clip(raw_t_cpa, 0.0, horizon), 0.0)
+        approaching = np.isfinite(raw_t_cpa) & (raw_t_cpa >= 0.0)
+        cpa_vector = relative_position + relative_velocity * t_cpa[:, None]
+        cpa_distance = np.sqrt(np.einsum("ij,ij->i", cpa_vector, cpa_vector))
+        envelope = collision_envelope_radius(
+            cfg, state.diameters, state.ages, t_cpa, tentative=tentative
+        )
+        cpa_clearance = cpa_distance - envelope
+
+        # Rank by predicted CPA clearance, not instantaneous range. A stable
+        # sort keeps the original track order among equal clearances.
+        order = np.argsort(cpa_clearance, kind="stable")
+        order = order[:max(1, int(cfg.max_planning_tracks))]
         return {
-            "position": np.asarray([x["position"] for x in usable], dtype=float),
-            "velocity": np.asarray([x["velocity"] for x in usable], dtype=float),
-            "age": np.asarray([x["age"] for x in usable], dtype=float),
-            "diameter": np.asarray([x["diameter"] for x in usable], dtype=float),
-            "tentative": np.asarray([x["tentative"] for x in usable], dtype=bool),
-            "identifier": np.asarray([x["identifier"] for x in usable], dtype=int),
-            "cpa_time": np.asarray([x["cpa_time"] for x in usable], dtype=float),
-            "cpa_clearance": np.asarray([x["cpa_clearance"] for x in usable], dtype=float),
-            "approaching": np.asarray([x["approaching"] for x in usable], dtype=bool),
-            "cpa_vector": np.asarray([x["cpa_vector"] for x in usable], dtype=float),
-            "relative_position": np.asarray([x["relative_position"] for x in usable], dtype=float),
-            "relative_velocity": np.asarray([x["relative_velocity"] for x in usable], dtype=float),
+            "position": state.positions[order],
+            "velocity": state.velocities[order],
+            "age": state.ages[order],
+            "diameter": state.diameters[order],
+            "tentative": tentative[order],
+            "identifier": state.identifiers[order],
+            "cpa_time": t_cpa[order],
+            "cpa_clearance": cpa_clearance[order],
+            "approaching": approaching[order],
+            "cpa_vector": cpa_vector[order],
+            "relative_position": relative_position[order],
+            "relative_velocity": relative_velocity[order],
         }
 
     def _candidate_specs(
@@ -290,7 +252,7 @@ class PredictivePlanner:
             limit_norm(row, max_accel) for row in requested
         ], dtype=float)
 
-    def _rollout_candidates(
+    def _propagate_candidates(
         self,
         position,
         velocity,
@@ -316,35 +278,30 @@ class PredictivePlanner:
 
         p = np.repeat(position[None, :], count, axis=0)
         v = np.repeat(velocity[None, :], count, axis=0)
-        risk_cost = np.zeros(count, dtype=float)
-        minimum_clearance = np.full(count, float("inf"), dtype=float)
-        closest_time = np.full(count, float("nan"), dtype=float)
-        closest_track_id = np.full(count, -1, dtype=int)
 
         steps = max(1, int(np.ceil(
             float(cfg.horizon_s) / max(float(cfg.step_s), 1.0e-3)
         )))
         dt = float(cfg.horizon_s) / steps
+        # V5 Phase 2b: candidate trajectories do not depend on debris, so
+        # they are propagated first (identical guidance arithmetic) and the
+        # swept-clearance geometry is evaluated afterwards, exactly, by
+        # _clearance_bounds + _resolve_clearance.
+        shuttle_positions = np.empty((steps + 1, count, 3), dtype=float)
+        shuttle_positions[0] = p
 
-        if track_arrays is not None:
-            debris_positions = track_arrays["position"]
-            debris_velocities = track_arrays["velocity"]
-            ages = track_arrays["age"]
-            diameters = track_arrays["diameter"]
-            tentative = track_arrays["tentative"]
-            identifiers = track_arrays["identifier"]
-            velocity_uncertainty = np.where(
-                tentative,
-                float(cfg.tentative_velocity_uncertainty_mps),
-                float(cfg.confirmed_velocity_uncertainty_mps),
-            )
-            base_radii = (
-                float(cfg.shuttle_radius_m)
-                + 0.5 * diameters
-                + float(cfg.clearance_margin_m)
-                + float(cfg.initial_uncertainty_m)
-                + tentative.astype(float) * float(cfg.new_track_uncertainty_m)
-            )
+        # Step-invariant constants (V5 Phase 2b: hoisted; identical values).
+        capture_radius = float(cfg.capture_radius_m)
+        braking_accel = max(
+            float(max_accel) * float(cfg.braking_accel_fraction),
+            1.0e-5,
+        )
+        terminal_speed_squared = float(cfg.terminal_speed_mps) ** 2
+        goal_speed = float(cfg.goal_speed)
+        fade_distance = max(float(cfg.bias_fade_distance_m), 1.0)
+        velocity_gain = float(cfg.velocity_gain)
+        latency = float(cfg.control_latency_s)
+        any_hold = bool(np.any(holds))
 
         for step in range(steps):
             tau0 = step * dt
@@ -355,23 +312,19 @@ class PredictivePlanner:
             safe_distances = np.maximum(distances, 1.0e-9)
             goal_directions = relative_to_target / safe_distances[:, None]
 
-            outside = distances > float(cfg.capture_radius_m)
+            outside = distances > capture_radius
             remaining = np.maximum(
-                distances - float(cfg.capture_radius_m), 0.0
-            )
-            braking_accel = max(
-                float(max_accel) * float(cfg.braking_accel_fraction),
-                1.0e-5,
+                distances - capture_radius, 0.0
             )
             speeds = np.sqrt(
-                float(cfg.terminal_speed_mps) ** 2
+                terminal_speed_squared
                 + 2.0 * braking_accel * remaining
             )
-            speeds = np.minimum(speeds, float(cfg.goal_speed))
+            speeds = np.minimum(speeds, goal_speed)
             speeds *= speed_scales
 
             bias_fade = np.clip(
-                remaining / max(float(cfg.bias_fade_distance_m), 1.0),
+                remaining / fade_distance,
                 0.0,
                 1.0,
             )
@@ -400,35 +353,38 @@ class PredictivePlanner:
 
             # Terminal capture is the same for every avoidance candidate:
             # settle relative position and velocity instead of orbiting past.
-            capture_directions = goal_directions.copy()
-            zero_range = distances <= 1.0e-9
-            capture_directions[zero_range] = np.array([1.0, 0.0, 0.0])
-            standoff_error = (
-                distances - float(cfg.capture_standoff_m)
-            )
-            capture_velocity = (
-                float(cfg.capture_gain_per_s)
-                * standoff_error[:, None]
-                * capture_directions
-            )
-            capture_norms = np.linalg.norm(capture_velocity, axis=1)
-            capture_scale = np.minimum(
-                1.0,
-                float(cfg.capture_max_speed_mps)
-                / np.maximum(capture_norms, 1.0e-9),
-            )
-            capture_velocity *= capture_scale[:, None]
-            desired_relative[outside == False] = capture_velocity[outside == False]
-            desired_relative[holds] = 0.0
+            # V5 Phase 2b: only computed when some candidate is inside the
+            # capture radius (it is discarded for candidates outside it).
+            if not np.all(outside):
+                capture_directions = goal_directions.copy()
+                zero_range = distances <= 1.0e-9
+                capture_directions[zero_range] = np.array([1.0, 0.0, 0.0])
+                standoff_error = (
+                    distances - float(cfg.capture_standoff_m)
+                )
+                capture_velocity = (
+                    float(cfg.capture_gain_per_s)
+                    * standoff_error[:, None]
+                    * capture_directions
+                )
+                capture_norms = np.linalg.norm(capture_velocity, axis=1)
+                capture_scale = np.minimum(
+                    1.0,
+                    float(cfg.capture_max_speed_mps)
+                    / np.maximum(capture_norms, 1.0e-9),
+                )
+                capture_velocity *= capture_scale[:, None]
+                desired_relative[outside == False] = capture_velocity[outside == False]
+            if any_hold:
+                desired_relative[holds] = 0.0
 
             desired_world_velocity = (
                 target_velocity[None, :] + desired_relative
             )
-            requested = float(cfg.velocity_gain) * (
+            requested = velocity_gain * (
                 desired_world_velocity - v
             )
 
-            latency = float(cfg.control_latency_s)
             if tau0 < latency:
                 active_fraction = float(np.clip(
                     (tau1 - latency) / max(dt, 1.0e-9), 0.0, 1.0
@@ -440,73 +396,60 @@ class PredictivePlanner:
             )
             next_position = p + v * dt + 0.5 * acceleration * dt * dt
             next_velocity = v + acceleration * dt
-
-            if track_arrays is not None:
-                debris_start = (
-                    debris_positions + debris_velocities * tau0
-                )
-                debris_end = (
-                    debris_positions + debris_velocities * tau1
-                )
-                relative_start = p[:, None, :] - debris_start[None, :, :]
-                relative_end = (
-                    next_position[:, None, :] - debris_end[None, :, :]
-                )
-                delta = relative_end - relative_start
-                denominator = np.einsum("mni,mni->mn", delta, delta)
-                numerator = -np.einsum("mni,mni->mn", relative_start, delta)
-                fractions = np.zeros_like(denominator)
-                moving = denominator > 1.0e-9
-                fractions[moving] = np.clip(
-                    numerator[moving] / denominator[moving], 0.0, 1.0
-                )
-                closest = relative_start + fractions[:, :, None] * delta
-                separations = np.linalg.norm(closest, axis=2)
-                time_at_closest = tau0 + fractions * dt
-                total_age = ages[None, :] + time_at_closest
-                uncertainty = (
-                    float(cfg.uncertainty_growth_mps) * total_age
-                    + 0.5 * float(cfg.uncertainty_accel_mps2) * total_age ** 2
-                    + velocity_uncertainty[None, :] * total_age
-                )
-                clearances = separations - (
-                    base_radii[None, :] + uncertainty
-                )
-
-                local_indices = np.argmin(clearances, axis=1)
-                local_minima = clearances[
-                    np.arange(count), local_indices
-                ]
-                improved = local_minima < minimum_clearance
-                if np.any(improved):
-                    rows = np.where(improved)[0]
-                    cols = local_indices[improved]
-                    minimum_clearance[improved] = local_minima[improved]
-                    closest_time[improved] = time_at_closest[rows, cols]
-                    closest_track_id[improved] = identifiers[cols]
-
-                hard = float(cfg.minimum_safe_clearance_m)
-                preferred = float(cfg.replan_buffer_m)
-                collision = clearances < hard
-                near = (
-                    (clearances >= hard)
-                    & (clearances < preferred)
-                )
-                risk_cost += np.sum(
-                    5000.0
-                    * np.square(np.maximum(0.0, hard - clearances))
-                    * collision,
-                    axis=1,
-                )
-                risk_cost += np.sum(
-                    35.0
-                    * np.square(np.maximum(0.0, preferred - clearances))
-                    * near,
-                    axis=1,
-                )
+            shuttle_positions[step + 1] = next_position
 
             p = next_position
             v = next_velocity
+
+        return {
+            "shuttle_positions": shuttle_positions,
+            "terminal_position": p,
+            "terminal_velocity": v,
+            "dt": dt,
+            "steps": steps,
+            "count": count,
+        }
+
+    def _rollout_candidates(
+        self,
+        position,
+        velocity,
+        target_position,
+        target_velocity,
+        timestamp,
+        biases,
+        speed_scales,
+        holds,
+        max_accel,
+        track_arrays=None,
+        acceleration_limiter=None,
+    ):
+        """Phase 1 API: propagate every candidate, then evaluate clearance."""
+        propagation = self._propagate_candidates(
+            position, velocity, target_position, target_velocity, timestamp,
+            biases, speed_scales, holds, max_accel,
+            track_arrays=track_arrays, acceleration_limiter=acceleration_limiter,
+        )
+        geometry = self._clearance_bounds(propagation, track_arrays)
+        return self._complete_rollout(propagation, geometry, target_position, target_velocity)
+
+    def _complete_rollout(self, propagation, geometry, target_position, target_velocity):
+        """Exact clearance results plus terminal metrics for propagated candidates."""
+        cfg = self.config
+        count = propagation["count"]
+        p = propagation["terminal_position"]
+        v = propagation["terminal_velocity"]
+        target_position = np.asarray(target_position, dtype=float).reshape(3)
+        target_velocity = np.asarray(target_velocity, dtype=float).reshape(3)
+        if geometry is None:
+            risk_cost = np.zeros(count, dtype=float)
+            minimum_clearance = np.full(count, float("inf"), dtype=float)
+            closest_time = np.full(count, float("nan"), dtype=float)
+            closest_track_id = np.full(count, -1, dtype=int)
+        else:
+            risk_cost, minimum_clearance, closest_time, closest_track_id = (
+                self._resolve_clearance(geometry)
+            )
 
         target_final = (
             target_position + target_velocity * float(cfg.horizon_s)
@@ -529,6 +472,208 @@ class PredictivePlanner:
             "terminal_velocity": v,
         }
 
+    def _swept_clearance_exact(self, shuttle_positions, track_arrays, dt, steps):
+        """Exact risk / minimum clearance for given trajectories (bounds + resolve)."""
+        propagation = {
+            "shuttle_positions": shuttle_positions, "dt": dt, "steps": steps,
+            "count": shuttle_positions.shape[1],
+        }
+        return self._resolve_clearance(self._clearance_bounds(propagation, track_arrays))
+
+    def _clearance_bounds(self, propagation, track_arrays):
+        """Exact swept-clearance risk and minimum clearance, evaluated lazily.
+
+        Mathematically identical to evaluating every (step, candidate, track)
+        swept closest approach (the Phase 1 model), but pairs that provably
+        cannot matter are skipped:
+
+        * Steps are grouped into chunks. Within a chunk each candidate's
+          piecewise-linear path lies inside a sphere around its waypoints,
+          and each debris path (straight) inside a sphere around its chord.
+          Any simultaneous separation is >= |centre distance| - both radii.
+          Uncertainty grows monotonically with time, so subtracting the
+          envelope at the chunk END gives a lower bound on clearance.
+        * Pass A evaluates exactly every unit (candidate, chunk, track) whose
+          bound is below the preferred buffer -> risk is exact (units at or
+          above the buffer contribute exactly zero risk) - plus each
+          candidate's lowest-bound units, giving an upper bound U on its
+          minimum clearance.
+        * Pass B evaluates every remaining unit whose bound is below U.
+          Every unit never evaluated then has clearance strictly greater
+          than the candidate's true minimum, so the minimum, its time and
+          its track (with Phase 1 tie-breaking: earliest step, lowest index)
+          are exact.
+        A small epsilon keeps the bounds conservative against rounding.
+        """
+        if track_arrays is None or len(track_arrays["position"]) == 0:
+            return None
+        cfg = self.config
+        shuttle_positions = propagation["shuttle_positions"]
+        dt = propagation["dt"]
+        steps = propagation["steps"]
+        count = shuttle_positions.shape[1]
+        debris_positions = track_arrays["position"]
+        debris_velocities = track_arrays["velocity"]
+        tentative = track_arrays["tentative"]
+        tracks = debris_positions.shape[0]
+        geometry = {
+            "ages": track_arrays["age"],
+            "identifiers": track_arrays["identifier"],
+            "velocity_uncertainty": np.where(
+                tentative,
+                float(cfg.tentative_velocity_uncertainty_mps),
+                float(cfg.confirmed_velocity_uncertainty_mps),
+            ),
+            "base_radii": (
+                float(cfg.shuttle_radius_m)
+                + 0.5 * track_arrays["diameter"]
+                + float(cfg.clearance_margin_m)
+                + float(cfg.initial_uncertainty_m)
+                + tentative.astype(float) * float(cfg.new_track_uncertainty_m)
+            ),
+            "growth": float(cfg.uncertainty_growth_mps),
+            "half_accel": 0.5 * float(cfg.uncertainty_accel_mps2),
+            "hard": float(cfg.minimum_safe_clearance_m),
+            "preferred": float(cfg.replan_buffer_m),
+            "dt": dt,
+        }
+        step_times = np.arange(steps + 1, dtype=float) * dt
+        debris_at_steps = (
+            debris_positions[None, :, :]
+            + debris_velocities[None, :, :] * step_times[:, None, None]
+        )
+        geometry["shuttle"] = shuttle_positions
+        geometry["debris"] = debris_at_steps
+
+        # Chunk bounding spheres and the clearance lower bound per unit.
+        chunk = max(1, int(getattr(cfg, "planner_bound_chunk_steps", 4)))
+        starts = np.arange(0, steps, chunk)
+        ends = np.minimum(starts + chunk, steps)
+        chunks = starts.size
+        shuttle_centres = np.empty((chunks, count, 3))
+        shuttle_radii = np.empty((chunks, count))
+        for j in range(chunks):
+            points = shuttle_positions[starts[j]:ends[j] + 1]
+            centre = 0.5 * (points.min(axis=0) + points.max(axis=0))
+            offsets = points - centre[None, :, :]
+            shuttle_centres[j] = centre
+            shuttle_radii[j] = np.sqrt(np.einsum("kci,kci->kc", offsets, offsets)).max(axis=0)
+        debris_centres = 0.5 * (debris_at_steps[starts] + debris_at_steps[ends])
+        chord = debris_at_steps[ends] - debris_at_steps[starts]
+        debris_radii = 0.5 * np.sqrt(np.einsum("jmi,jmi->jm", chord, chord))
+        age_end = geometry["ages"][None, :] + step_times[ends][:, None]
+        envelope_end = geometry["base_radii"][None, :] + (
+            geometry["growth"] * age_end
+            + geometry["half_accel"] * age_end ** 2
+            + geometry["velocity_uncertainty"][None, :] * age_end
+        )
+        centre_offset = shuttle_centres[:, :, None, :] - debris_centres[:, None, :, :]
+        lower_bound = (
+            np.sqrt(np.einsum("jcmi,jcmi->jcm", centre_offset, centre_offset))
+            - shuttle_radii[:, :, None]
+            - debris_radii[:, None, :]
+            - envelope_end[:, None, :]
+            - 1.0e-6
+        ).transpose(1, 0, 2)                       # (candidate, chunk, track)
+        geometry["starts"], geometry["ends"] = starts, ends
+        geometry["lower_bound"] = lower_bound
+        geometry["count"], geometry["tracks"], geometry["chunks"] = count, tracks, chunks
+        return geometry
+
+    def _resolve_clearance(self, geometry):
+        """Exact evaluation of every unit the bounds cannot exclude (passes A and B)."""
+        cfg = self.config
+        lower_bound = geometry["lower_bound"]
+        count, tracks, chunks = geometry["count"], geometry["tracks"], geometry["chunks"]
+
+        # Pass A: every (chunk, track) that can carry risk for any candidate,
+        # plus each candidate's lowest-bound units as seeds for its minimum.
+        need = lower_bound < geometry["preferred"]
+        seeds = min(int(getattr(cfg, "planner_bound_seed_units", 8)), chunks * tracks)
+        seed_index = np.argpartition(lower_bound.reshape(count, -1), seeds - 1, axis=1)[:, :seeds]
+        need.reshape(count, -1)[np.arange(count)[:, None], seed_index] = True
+        evaluated = need.any(axis=0)                     # (chunk, track)
+        state = {
+            "risk": np.zeros(count),
+            "minimum": np.full(count, np.inf),
+            "key": np.full(count, np.iinfo(np.int64).max, dtype=np.int64),
+            "time": np.full(count, np.nan),
+            "id": np.full(count, -1, dtype=int),
+        }
+        self._evaluate_chunks(evaluated, geometry, state, tracks)
+
+        # Pass B: (chunk, track) pairs whose bound is below some candidate's
+        # current minimum and that were not evaluated yet.
+        pending = (lower_bound < state["minimum"][:, None, None]).any(axis=0) & ~evaluated
+        if np.any(pending):
+            self._evaluate_chunks(pending, geometry, state, tracks)
+        return state["risk"], state["minimum"], state["time"], state["id"]
+
+    @staticmethod
+    def _evaluate_chunks(mask, geometry, state, tracks):
+        """Exact swept closest approach, all candidates x selected tracks per chunk.
+
+        Identical expressions to the Phase 1 per-step loop. Combining with
+        `state` keeps the Phase 1 tie-breaking: smaller clearance wins, then
+        the earlier step, then the lower track index.
+        """
+        shuttle, debris, dt = geometry["shuttle"], geometry["debris"], geometry["dt"]
+        hard, preferred = geometry["hard"], geometry["preferred"]
+        count = shuttle.shape[1]
+        rows = np.arange(count)
+        for j in range(mask.shape[0]):
+            selected = np.nonzero(mask[j])[0]
+            if selected.size == 0:
+                continue
+            k0, k1 = int(geometry["starts"][j]), int(geometry["ends"][j])
+            path = shuttle[k0:k1 + 1]                         # (Q+1, C, 3)
+            debris_path = debris[k0:k1 + 1][:, selected]      # (Q+1, Mj, 3)
+            relative_start = path[:-1, :, None, :] - debris_path[:-1, None, :, :]
+            delta = (
+                (path[1:] - path[:-1])[:, :, None, :]
+                - (debris_path[1:] - debris_path[:-1])[:, None, :, :]
+            )
+            denominator = np.einsum("qcmi,qcmi->qcm", delta, delta)
+            numerator = -np.einsum("qcmi,qcmi->qcm", relative_start, delta)
+            fractions = np.zeros_like(denominator)
+            np.divide(numerator, denominator, out=fractions, where=denominator > 1.0e-9)
+            np.clip(fractions, 0.0, 1.0, out=fractions)
+            closest = relative_start + fractions[..., None] * delta
+            separations = np.sqrt(np.einsum("qcmi,qcmi->qcm", closest, closest))
+            time_at_closest = (np.arange(k0, k1) * dt)[:, None, None] + fractions * dt
+            total_age = geometry["ages"][selected][None, None, :] + time_at_closest
+            uncertainty = (
+                geometry["growth"] * total_age
+                + geometry["half_accel"] * total_age ** 2
+                + geometry["velocity_uncertainty"][selected][None, None, :] * total_age
+            )
+            clearances = separations - (geometry["base_radii"][selected][None, None, :] + uncertainty)
+
+            shortfall = np.maximum(0.0, hard - clearances)
+            near = (clearances >= hard) & (clearances < preferred)
+            buffer_shortfall = np.where(near, preferred - clearances, 0.0)
+            state["risk"] += (
+                5000.0 * np.einsum("qcm,qcm->c", shortfall, shortfall)
+                + 35.0 * np.einsum("qcm,qcm->c", buffer_shortfall, buffer_shortfall)
+            )
+
+            # Step-major order -> argmin picks the earliest step, then the
+            # lowest track index (selected is ascending).
+            per_candidate = clearances.transpose(1, 0, 2).reshape(count, -1)
+            index = np.argmin(per_candidate, axis=1)
+            values = per_candidate[rows, index]
+            q, local = np.divmod(index, selected.size)
+            track_index = selected[local]
+            key = (k0 + q).astype(np.int64) * tracks + track_index
+            better = (values < state["minimum"]) | (
+                (values == state["minimum"]) & (key < state["key"])
+            )
+            if np.any(better):
+                state["minimum"][better] = values[better]
+                state["key"][better] = key[better]
+                state["time"][better] = time_at_closest[q, rows, local][better]
+                state["id"][better] = geometry["identifiers"][track_index][better]
+
     def plan(
         self,
         position,
@@ -540,6 +685,32 @@ class PredictivePlanner:
         max_accel=None,
         acceleration_limiter=None,
     ):
+        """Complete planning cycle: stage one followed immediately by stage two."""
+        job = self.plan_stage_one(
+            position, velocity, target_position, target_velocity, tracks,
+            timestamp, max_accel=max_accel, acceleration_limiter=acceleration_limiter,
+        )
+        return self.plan_stage_two(job)
+
+    def plan_stage_one(
+        self,
+        position,
+        velocity,
+        target_position,
+        target_velocity,
+        tracks,
+        timestamp,
+        max_accel=None,
+        acceleration_limiter=None,
+    ):
+        """Stage 1 (V5 Phase 2b): shortlist, candidate set, trajectory
+        propagation and clearance bounds. Returns a job for plan_stage_two.
+
+        Splitting the cycle lets the controller keep every tick inside its
+        deadline; the two stages together compute exactly what plan() does
+        for the inputs given here. Stage 1 updates the planner's lateral
+        basis (as plan() always did); exactly one stage 2 must follow.
+        """
         cfg = self.config
         position = np.asarray(position, dtype=float).reshape(3)
         velocity = np.asarray(velocity, dtype=float).reshape(3)
@@ -562,18 +733,47 @@ class PredictivePlanner:
         speed_scales = np.asarray([item[2] for item in specs], dtype=float)
         holds = np.asarray([item[3] for item in specs], dtype=bool)
 
-        rollout = self._rollout_candidates(
-            position,
-            velocity,
-            target_position,
-            target_velocity,
-            timestamp,
-            biases,
-            speed_scales,
-            holds,
-            max_accel,
-            track_arrays=track_arrays,
-            acceleration_limiter=acceleration_limiter,
+        propagation = self._propagate_candidates(
+            position, velocity, target_position, target_velocity, timestamp,
+            biases, speed_scales, holds, max_accel,
+            track_arrays=track_arrays, acceleration_limiter=acceleration_limiter,
+        )
+        return {
+            "position": position,
+            "velocity": velocity,
+            "target_position": target_position,
+            "target_velocity": target_velocity,
+            "timestamp": timestamp,
+            "max_accel": max_accel,
+            "acceleration_limiter": acceleration_limiter,
+            "goal_vector": goal_vector,
+            "track_arrays": track_arrays,
+            "names": names,
+            "biases": biases,
+            "speed_scales": speed_scales,
+            "holds": holds,
+            "propagation": propagation,
+            "geometry": self._clearance_bounds(propagation, track_arrays),
+        }
+
+    def plan_stage_two(self, job):
+        """Stage 2 (V5 Phase 2b): exact clearance evaluation, candidate
+        selection, safety state and command, for a plan_stage_one job."""
+        cfg = self.config
+        position = job["position"]
+        velocity = job["velocity"]
+        target_position = job["target_position"]
+        target_velocity = job["target_velocity"]
+        max_accel = job["max_accel"]
+        acceleration_limiter = job["acceleration_limiter"]
+        goal_vector = job["goal_vector"]
+        track_arrays = job["track_arrays"]
+        names = job["names"]
+        biases = job["biases"]
+        speed_scales = job["speed_scales"]
+        holds = job["holds"]
+        rollout = self._complete_rollout(
+            job["propagation"], job["geometry"], target_position, target_velocity
         )
 
         initial_distance = norm(goal_vector)

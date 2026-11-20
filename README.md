@@ -17,6 +17,14 @@ python -B tests\run_tests.py --site-packages $sp
 
 `-B` prevents writing bytecode into the STPro environment.
 
+Offline per-tick benchmark (Phase 1 flow vs current flow):
+
+```powershell
+python -B tests\benchmark_pipeline.py --site-packages $sp --seconds 20
+```
+
+Benchmark numbers are machine-dependent and exclude STPro API calls.
+
 ## Deployment tools (do not run without explicit approval)
 
 - `verify_installed_v5.ps1` — read-only report of what STPro will load.

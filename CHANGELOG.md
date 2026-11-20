@@ -1,3 +1,109 @@
+# V5.0-dev — Phase 2b (60 Hz deadline engineering, offline)
+
+Offline-benchmarked only. Not deployed. No live STPro timing exists for V5.
+Navigation results are unchanged: every change is equivalence-tested against
+frozen Phase 1 code (`tests/reference/`, commit 307cacb).
+
+## Planner profile (Phase 2, 500 debris)
+Rollout ~17.6 ms of ~19.4 ms per plan: swept-CPA geometry 9.2 ms, min/risk
+reductions 2.0 ms, guidance propagation 3.3 ms, limiter callback 3.1 ms.
+
+## Changes
+- Exact bounded clearance evaluation (`planning.py` `_clearance_bounds`,
+  `_resolve_clearance`, `_evaluate_chunks`): trajectories are propagated
+  first; per-chunk bounding spheres give provable clearance lower bounds;
+  every unit that can carry risk or hold the minimum is evaluated with the
+  Phase 1 formula. Identical closest-track ids in all tests; values within
+  rounding (<=1.7e-13 relative); result independent of chunk size.
+- Two-stage planning API: `plan_stage_one` (shortlist, candidates,
+  propagation, bounds) and `plan_stage_two` (exact clearance, selection,
+  command); `plan()` = stage one + stage two (bit-identical outputs).
+- `phobos_nav/scheduling.py` `DeadlinePlanner`: runs a stage only if it fits
+  `control_tick_budget_s` (14 ms) given time already spent in the tick
+  (90th-percentile recent stage duration); requests latch; at most
+  `planner_max_stage_wait_ticks` (2) ticks of deferral, then forced; jobs
+  older than 0.1 s (the planner's modelled control latency) are re-planned.
+  `Controller.py` uses it instead of a synchronous `planner.plan()`.
+- Guidance propagation: step-invariant constants hoisted; terminal-capture
+  math skipped when no candidate is inside the capture radius (identical).
+- `actuator_model.limit_acceleration_body_batch`: fast path when every axis
+  has authority (as the controller requires); bit-identical to Phase 1
+  (3000+ random cases); 48 -> 27 us per call.
+- Tracker: batched Kalman update (`_kf_update_batch`), vectorized
+  association bookkeeping and measurement covariances, O(log n)
+  `StateHistory.sample` (bit-identical). Whole-tracker replay equivalence
+  vs Phase 1: identical per-poll stats/ids/hits, states within 1.1e-13.
+- Radar ingestion cap `radar_max_new_records_per_tick` (100, nearest first):
+  spreads the one-time 500-record bootstrap over ~5 ticks; never binds in
+  steady state (~50 new records per publication).
+- Controller log: `plan_stage1_ms`, `plan_stage2_ms`, `plans_completed_total`,
+  `plan_deferrals_total`, `plan_forced_total`, `plan_discarded_total`,
+  `radar_deferred_new`.
+
+## Offline results (`tests/benchmark_pipeline.py`, 500 debris, 25 s, 60 Hz)
+| ms                       | Phase 1 sparse | current sparse | Phase 1 dense | current dense |
+|--------------------------|----------------|----------------|---------------|---------------|
+| all ticks p50 / p99      | 37.4 / 72.5    | 7.7 / 14.0     | 37.2 / 72.7   | 8.5 / 14.6    |
+| planning ticks p99       | 84.6           | 13.6           | 84.5          | 15.0          |
+| ticks over 16.67 ms      | 68.3 %         | 0.29 %         | 68.3 %        | 0.50 %        |
+Planner call alone: sparse ~6.6 ms, dense ~11.5 ms (Phase 1 ~28 ms).
+Residual over-budget ticks are isolated 3-5x stalls of a single operation;
+the same desktop stalls a fixed 2 ms workload to p99 6.9 ms / max 50 ms.
+Excludes STPro API calls; with 2 ms assumed API overhead: 0.64-0.78 %.
+
+## Tests
+- `tests/test_v5_deadline.py` (12 tests); frozen references
+  `tests/reference/tracking_phase1.py`, `actuator_model_phase1.py`.
+
+# V5.0-dev — Phase 2 (offline performance)
+
+Offline-benchmarked only. Not deployed. No live STPro timing exists for V5.
+Navigation mathematics unchanged: every optimization is equivalence-tested
+against frozen Phase 1 copies (`tests/reference/`, commit 307cacb).
+
+## Profiling (Phase 1, 500 debris, offline)
+- Per tick: radar block ~20 ms (decode of all 500 records, ~450 of them
+  cached copies; `StateHistory.sample` called 500x/tick), threat scans
+  ~4.5 ms, planner ~36 ms per call (Python loop over all tracks in the
+  shortlist, 40-step rollout). Mean ~33 ms/tick (~31 Hz compute ceiling).
+
+## Changes
+- Pre-decode filter: `DebrisTracker.select_new_records()` recognises cached
+  records by raw bytes; `Controller.py` decodes only new records and passes
+  `prefiltered_duplicates` to `tracker.update()`. Tracker state is
+  bit-identical with the filter on or off (test).
+- `phobos_nav/threats.py`: vectorized nearest-track distance and
+  warning-envelope TTC (replace the per-track loops formerly at
+  Controller.py:300-353 and 550-558). Tracks lacking `position_at` are
+  excluded exactly as before (the old nearest-track loop would have raised).
+- Planner `_prepare_track_arrays`: vectorized shortlist (same ordering).
+- Planner `_rollout_candidates`: precomputed debris step positions, direct
+  segment displacement, masked division, einsum norms; redundant collision
+  mask removed. Max relative difference vs Phase 1: 4.3e-14 (rounding);
+  identical decisions over a 25-step 500-track sequence (test).
+- Radar clock `_max_timestamp`: vectorized with exact loop fallback.
+- Controller log (logging only): `radar_decoded` keeps its V4.3 meaning
+  (valid records decoded this poll + valid records decoded earlier and
+  still present); new `radar_new_decoded`, `radar_ms`, `threat_ms`,
+  `loop_interval_ms`, `prev_loop_work_ms`, `loop_overruns_total`.
+
+## Offline benchmark (`tests/benchmark_pipeline.py`, planner every 2 ticks)
+| ms (p50)            | Phase 1 | Phase 2 |
+|---------------------|---------|---------|
+| radar block         | 19.83   | 1.23    |
+| threat scans        | 4.45    | 0.81    |
+| planner call        | 35.81   | 18.33   |
+| tick without plan   | 24.27   | 2.07    |
+| tick with plan      | 60.12   | 20.66   |
+| mean work per tick  | 32.75   | 7.00    |
+
+Excludes STPro API calls (state reads, frame transforms, SetCommand).
+
+## Tests
+- `tests/test_v5_performance_equivalence.py` (9 tests) and frozen
+  references `tests/reference/planning_phase1.py`,
+  `tests/reference/controller_threats_phase1.py`.
+
 # V5.0-dev — Phases 0 and 1
 
 Offline-tested only. Not deployed. No live STPro result exists for V5.

@@ -69,6 +69,10 @@ class Config:
     # missed its expected revisit) instead of spawning a duplicate.
     track_reacquire_min_fraction: float = 0.75
     radar_seen_key_retention_s: float = 15.0
+    # V5 Phase 2b: at most this many unseen radar records are decoded per
+    # tick (nearest first); the rest wait one tick. Steady state brings
+    # ~50 per publication, so this only spreads the 500-record bootstrap.
+    radar_max_new_records_per_tick: int = 100
     alpha: float = 0.70  # legacy (V4.3 alpha-beta); unused by the V5 tracker
     beta: float = 0.18  # legacy (V4.3 alpha-beta); unused by the V5 tracker
     confirmation_hits: int = 3
@@ -106,6 +110,21 @@ class Config:
     # Keep the real-time MPC workload bounded; planner selects the 128 lowest
     # predicted CPA-clearance tracks from the full retained track set.
     max_planning_tracks: int = 128
+    # V5 Phase 2b exact bounded clearance evaluation (performance only; the
+    # result is identical for any values): steps per bounding chunk and
+    # seed units per candidate used to bound its minimum clearance.
+    planner_bound_chunk_steps: int = 4
+    planner_bound_seed_units: int = 8
+
+    # V5 Phase 2b deadline-aware planner execution (scheduling.py). A
+    # planner stage starts only if (time already spent in this tick + its
+    # recent worst duration) fits control_tick_budget_s; the rest of the
+    # 16.67 ms period is margin for SetCommand, logging and OS jitter.
+    control_tick_budget_s: float = 0.014
+    planner_max_stage_wait_ticks: int = 2     # <= 33 ms extra latency
+    planner_max_job_age_s: float = 0.10       # = control_latency_s modelled by the planner
+    planner_initial_stage_estimates_s: tuple = (0.006, 0.006)
+    planner_stage_history: int = 20
 
     # Replanning cadence.
     planner_update_every_n: int = 3

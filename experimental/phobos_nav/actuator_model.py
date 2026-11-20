@@ -96,6 +96,22 @@ def limit_acceleration_body_batch(
         return np.zeros_like(commands)
 
     magnitudes = np.linalg.norm(commands, axis=1)
+    if positive.min() > _EPS and negative.min() > _EPS:
+        # V5 Phase 2b fast path (every axis has authority, as the controller
+        # requires before planning): same arithmetic as the general path
+        # below, without boolean gathers/scatters. Every active axis has
+        # authority > _EPS, so no row is "invalid" for that reason.
+        moving = magnitudes > _EPS
+        safe_magnitudes = np.where(moving, magnitudes, 1.0)
+        directions = commands / safe_magnitudes[:, None]
+        axis_authority = np.where(directions >= 0.0, positive[None, :], negative[None, :])
+        denominators = np.sum(np.abs(directions) / axis_authority, axis=1)
+        valid = moving & (denominators > _EPS) & np.isfinite(denominators)
+        limits = factor / np.where(valid, denominators, 1.0)
+        scales = np.minimum(1.0, limits / np.maximum(magnitudes, _EPS))
+        scales = np.where(valid, scales, 0.0)
+        return commands * scales[:, None]
+
     output = np.zeros_like(commands)
     moving = magnitudes > _EPS
     if not np.any(moving):

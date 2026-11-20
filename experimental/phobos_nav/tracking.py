@@ -1,3 +1,4 @@
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass
 import numpy as np
@@ -8,6 +9,7 @@ except Exception:
     linear_sum_assignment = None
 
 from .geometry import vec3, norm, unit, limit_norm
+from .radar import raw_record_key
 
 
 class StateHistory:
@@ -16,12 +18,15 @@ class StateHistory:
     def __init__(self, max_age_s=8.0, max_samples=1200):
         self.max_age_s = float(max_age_s)
         self.samples = deque(maxlen=int(max_samples))
+        # V5 Phase 2b: parallel timestamps for O(log n) interval lookup.
+        self._times = deque(maxlen=int(max_samples))
 
     def __len__(self):
         return len(self.samples)
 
     def clear(self):
         self.samples.clear()
+        self._times.clear()
 
     def add(self, timestamp, position, velocity):
         timestamp = float(timestamp)
@@ -36,14 +41,17 @@ class StateHistory:
 
         if self.samples and abs(timestamp - self.samples[-1][0]) < 1.0e-9:
             self.samples[-1] = (timestamp, position, velocity)
+            self._times[-1] = timestamp
         else:
             self.samples.append((timestamp, position, velocity))
+            self._times.append(timestamp)
 
         while (
             len(self.samples) > 2
             and timestamp - self.samples[0][0] > self.max_age_s
         ):
             self.samples.popleft()
+            self._times.popleft()
 
     def sample(self, timestamp):
         if not self.samples:
@@ -61,21 +69,17 @@ class StateHistory:
             dt = timestamp - last_t
             return last_p + last_v * dt, last_v.copy()
 
-        previous = self.samples[0]
-        for following in self.samples:
-            if following[0] <= first_t:
-                continue
-            t0, p0, v0 = previous
-            t1, p1, v1 = following
-            if t0 <= timestamp <= t1:
-                span = max(t1 - t0, 1.0e-9)
-                fraction = (timestamp - t0) / span
-                position = p0 + fraction * (p1 - p0)
-                velocity = v0 + fraction * (v1 - v0)
-                return position, velocity
-            previous = following
-
-        return last_p.copy(), last_v.copy()
+        # first_t < timestamp < last_t: the bracketing interval is the first
+        # sample at or after `timestamp` and its predecessor (the same
+        # interval the former linear scan selected).
+        index = bisect_left(self._times, timestamp)
+        t0, p0, v0 = self.samples[index - 1]
+        t1, p1, v1 = self.samples[index]
+        span = max(t1 - t0, 1.0e-9)
+        fraction = (timestamp - t0) / span
+        position = p0 + fraction * (p1 - p0)
+        velocity = v0 + fraction * (v1 - v0)
+        return position, velocity
 
 
 @dataclass
@@ -134,6 +138,7 @@ class DebrisTracker:
         self._seen_measurements = {}
         self._revisit_samples = deque(maxlen=500)
         self._last_prune_s = -float("inf")
+        self.deferred_new_records = 0
         self.last_update_stats = {}
         self.cumulative = {
             "evicted": 0, "evicted_confirmed": 0, "reacquired": 0,
@@ -233,12 +238,53 @@ class DebrisTracker:
         return velocity, covariance
 
     # ------------------------------------------------------------------
+    def select_new_records(self, raw_records, timestamp, limit=None):
+        """Split raw Radar.py records into (unseen records, cached-copy count).
+
+        `limit` (V5 Phase 2b) caps the unseen records returned for this tick;
+        the rest are left unmarked and are therefore returned on the next
+        tick. Radar.py publishes records sorted by range, so the nearest
+        unseen objects are ingested first. In steady state a publication
+        carries ~N/10 new records and the cap does not bind; it spreads the
+        one-time bootstrap (all N records new) over a few ticks.
+        self.deferred_new_records reports how many were held back.
+
+        V5 Phase 2: lets the controller decode only genuinely new records.
+        Each publication carries ~N/10 new rows and ~9N/10 bit-identical
+        cached copies; decoding the copies (state-history interpolation,
+        range fusion) dominated the per-tick cost. Cached keys have their
+        last-seen time refreshed exactly as update() would. Records are only
+        marked as seen by update(), after they have been decoded, so an
+        undecodable or future-dated record is retried on the next poll.
+        """
+        timestamp = float(timestamp)
+        new_records = []
+        cached = 0
+        deferred = 0
+        cap = float("inf") if limit is None else max(1, int(limit))
+        seen = self._seen_measurements
+        for item in raw_records:
+            try:
+                key = raw_record_key(item)
+            except (TypeError, ValueError):
+                key = None
+            if key is not None and key in seen:
+                seen[key] = timestamp
+                cached += 1
+            elif len(new_records) < cap:
+                new_records.append(item)
+            else:
+                deferred += 1
+        self.deferred_new_records = deferred
+        return new_records, cached
+
     def update(
         self,
         observations,
         timestamp,
         shuttle_position,
-        shuttle_velocity
+        shuttle_velocity,
+        prefiltered_duplicates=0,
     ):
         cfg = self.config
         timestamp = float(timestamp)
@@ -263,7 +309,7 @@ class DebrisTracker:
         fresh_ages = []
         stale_count = 0
         future_count = 0
-        duplicate_count = 0
+        duplicate_count = int(prefiltered_duplicates)
         invalid_count = 0
 
         for obs in observations:
@@ -321,7 +367,7 @@ class DebrisTracker:
                     shuttle_velocity if obs_shuttle_velocity is None
                     else vec3(obs_shuttle_velocity)
                 )
-                position_cov = self._measurement_covariance(obs, relative_position)
+                position_cov = obs                  # resolved in bulk below
                 valid.append({
                     "position": position,
                     "diameter": diameter,
@@ -337,9 +383,12 @@ class DebrisTracker:
                 invalid_count += 1
                 continue
 
+        if valid:
+            self._resolve_measurement_covariances(valid)
+
         assigned = []          # (track index, observation index, pair data)
         replay = set()         # observation indices consistent with a newer/same-time track state
-        coarse_candidates = {}  # observation index -> list of (distance, track index, dt)
+        coarse_candidates = None  # coarse (track, obs) pairs, see _associate
 
         if self.tracks and valid:
             assigned, replay, coarse_candidates = self._associate(
@@ -350,11 +399,14 @@ class DebrisTracker:
         clamped_count = 0
         max_speed = float(cfg.max_track_speed_mps)
         updated_tracks = set()
+        if assigned:
+            # V5 Phase 2b: one batched predict/update for every assigned
+            # (track, observation) pair; identical equations to _kf_update.
+            self._kf_update_batch(assigned, valid, psd)
         for ti, oi, pair in assigned:
             track = self.tracks[ti]
             item = valid[oi]
             dt = item["time"] - track.timestamp
-            self._kf_update(track, item, dt, psd, pair)
             speed = norm(track.velocity)
             if speed > max_speed:
                 track.velocity = limit_norm(track.velocity, max_speed)
@@ -399,7 +451,7 @@ class DebrisTracker:
             # Re-acquire the nearest overdue track instead of creating a
             # duplicate that would leave the old track as a ghost.
             reacquire_index = None
-            for distance, ti, dt in sorted(coarse_candidates.get(oi, [])):
+            for distance, ti, dt in self._coarse_candidates_for(coarse_candidates, oi):
                 if ti in updated_tracks or ti in evicted or dt < reacquire_after:
                     continue
                 reacquire_index = ti
@@ -572,11 +624,12 @@ class DebrisTracker:
         )
         track_index, obs_index = np.nonzero(coarse)
 
-        coarse_candidates = {}
-        for ti, oi in zip(track_index.tolist(), obs_index.tolist()):
-            coarse_candidates.setdefault(oi, []).append(
-                (float(distances[ti, oi]), ti, float(dt_matrix[ti, oi]))
-            )
+        # Coarse pairs as arrays (queried lazily, only for observations that
+        # end up unassigned; see _coarse_candidates_for).
+        coarse_candidates = (
+            track_index, obs_index,
+            distances[track_index, obs_index], dt_matrix[track_index, obs_index],
+        )
         if track_index.size == 0:
             return [], set(), coarse_candidates
 
@@ -641,12 +694,9 @@ class DebrisTracker:
 
         rows = np.unique(pair_rows)
         cols = np.unique(pair_cols)
-        row_lookup = {int(r): i for i, r in enumerate(rows)}
-        col_lookup = {int(c): j for j, c in enumerate(cols)}
         invalid_cost = 1.0e9
         cost = np.full((rows.size, cols.size), invalid_cost, dtype=float)
-        for r, c, value in zip(pair_rows, pair_cols, pair_costs):
-            cost[row_lookup[int(r)], col_lookup[int(c)]] = value
+        cost[np.searchsorted(rows, pair_rows), np.searchsorted(cols, pair_cols)] = pair_costs
 
         assignments = []
         if linear_sum_assignment is not None:
@@ -673,8 +723,111 @@ class DebrisTracker:
         replay -= assigned_obs
         return assigned, replay, coarse_candidates
 
+    @staticmethod
+    def _coarse_candidates_for(coarse_candidates, observation_index):
+        """(distance, track index, dt) for one observation, ordered exactly as
+        sorted() ordered the former tuples: distance, then track, then dt."""
+        if coarse_candidates is None:
+            return []
+        track_index, obs_index, distances, dts = coarse_candidates
+        mask = obs_index == observation_index
+        if not np.any(mask):
+            return []
+        tracks, dist, dt = track_index[mask], distances[mask], dts[mask]
+        order = np.lexsort((dt, tracks, dist))
+        return [(float(dist[i]), int(tracks[i]), float(dt[i])) for i in order]
+
+    def _resolve_measurement_covariances(self, valid):
+        """Bulk version of _measurement_covariance for all fresh observations."""
+        extra = float(self._cfg("radar_measurement_extra_sigma_m", 0.0)) ** 2
+        default = self._default_position_covariance()
+        cross = np.asarray([
+            float(getattr(item["cov"], "measurement_cross_variance", float("nan")))
+            for item in valid
+        ])
+        radial_variance = np.asarray([
+            float(getattr(item["cov"], "measurement_radial_variance", float("nan")))
+            for item in valid
+        ])
+        radial = np.asarray([item["radial"] for item in valid], dtype=float)
+        bulk = (
+            (cross + extra)[:, None, None] * _I3[None, :, :]
+            + (radial_variance - cross)[:, None, None] * np.einsum("ki,kj->kij", radial, radial)
+        )
+        usable = np.isfinite(cross) & np.isfinite(radial_variance)
+        for index, item in enumerate(valid):
+            explicit = getattr(item["cov"], "measurement_covariance", None)
+            if explicit is not None:
+                item["cov"] = np.asarray(explicit, dtype=float).reshape(3, 3)
+            elif usable[index]:
+                item["cov"] = bulk[index]
+            else:
+                item["cov"] = default
+
+    def _kf_update_batch(self, assigned, valid, psd):
+        """Batched constant-velocity Kalman predict/update.
+
+        Same equations as _kf_update (kept below as the per-track reference):
+        predict with F(dt) and white-acceleration Q(|dt|), fuse position and
+        absolute radial speed, Joseph-form covariance update, symmetrize.
+        """
+        count = len(assigned)
+        state = np.empty((count, 6))
+        covariance = np.empty((count, 6, 6))
+        dt = np.empty(count)
+        radial = np.empty((count, 3))
+        noise = np.zeros((count, 4, 4))
+        measurement = np.empty((count, 4))
+        for k, (ti, oi, pair) in enumerate(assigned):
+            track = self.tracks[ti]
+            item = valid[oi]
+            if track.covariance is None:
+                self._track_covariances()
+            state[k, :3] = track.position
+            state[k, 3:] = track.velocity
+            covariance[k] = track.covariance
+            dt[k] = item["time"] - track.timestamp
+            radial[k] = item["radial"]
+            noise[k, :3, :3] = item["cov"]
+            noise[k, 3, 3] = float(pair["noise_rr"])
+            measurement[k, :3] = item["position"]
+            measurement[k, 3] = float(item["range_rate"]) + float(
+                np.dot(item["shuttle_velocity"], item["radial"])
+            )
+
+        transition = np.broadcast_to(np.eye(6), (count, 6, 6)).copy()
+        transition[:, :3, 3:] = dt[:, None, None] * _I3
+        abs_dt = np.abs(dt)
+        process = np.zeros((count, 6, 6))
+        process[:, :3, :3] = (psd * abs_dt ** 3 / 3.0)[:, None, None] * _I3
+        process[:, :3, 3:] = (psd * abs_dt ** 2 / 2.0)[:, None, None] * _I3
+        process[:, 3:, :3] = process[:, :3, 3:]
+        process[:, 3:, 3:] = (psd * abs_dt)[:, None, None] * _I3
+        state = np.einsum("kij,kj->ki", transition, state)
+        covariance = transition @ covariance @ np.transpose(transition, (0, 2, 1)) + process
+
+        observation = np.zeros((count, 4, 6))
+        observation[:, :3, :3] = _I3
+        observation[:, 3, 3:] = radial
+        innovation = measurement - np.einsum("kij,kj->ki", observation, state)
+        observation_t = np.transpose(observation, (0, 2, 1))
+        innovation_cov = observation @ covariance @ observation_t + noise
+        gain = np.transpose(np.linalg.solve(innovation_cov, observation @ covariance), (0, 2, 1))
+        state = state + np.einsum("kij,kj->ki", gain, innovation)
+        identity_minus = np.eye(6)[None, :, :] - gain @ observation
+        covariance = (
+            identity_minus @ covariance @ np.transpose(identity_minus, (0, 2, 1))
+            + gain @ noise @ np.transpose(gain, (0, 2, 1))
+        )
+        covariance = 0.5 * (covariance + np.transpose(covariance, (0, 2, 1)))
+        for k, (ti, _, _) in enumerate(assigned):
+            track = self.tracks[ti]
+            track.position = state[k, :3].copy()
+            track.velocity = state[k, 3:].copy()
+            track.covariance = covariance[k].copy()
+
     def _kf_update(self, track, item, dt, psd, pair):
-        """Predict to the measurement time and fuse position + range-rate."""
+        """Per-track reference of the predict/update used by _kf_update_batch."""
         covariance = track.covariance
         if covariance is None:
             covariance = self._track_covariances()[self.tracks.index(track)]
