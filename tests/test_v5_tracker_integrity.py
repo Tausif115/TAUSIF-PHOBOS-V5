@@ -55,9 +55,11 @@ def _assert_healthy_replay(result, scenario_n=500):
     assert max(entry["track_age_max"] for entry in late) < 5.5
     assert sum(entry["expired"] or 0 for entry in log) == 0
 
-    # Physically plausible velocities (true debris speed <= 4 m/s).
+    # Physically plausible velocities: no track faster than the fastest true
+    # object (live speed mix 0.5-10 m/s) plus 1 m/s of estimation error.
     speeds = [pair["speed"] for pair in final["pairs"]]
-    assert max(speeds) < 5.0
+    true_max = float(np.max(np.linalg.norm(result["world"].v, axis=1)))
+    assert max(speeds) < true_max + 1.0
     # Velocity errors must be consistent with the filter's own covariance
     # (NEES, 3 dof): mean ~3; 95th percentile below the chi-square 0.99
     # quantile (11.34). Absolute error depends on the number of revisits.

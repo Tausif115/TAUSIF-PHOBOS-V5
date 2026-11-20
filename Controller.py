@@ -744,6 +744,7 @@ while True:
             f"invalid={tracker.last_update_stats.get('invalid', 0)} "
             f"too_soon={tracker.last_update_stats.get('too_soon', 0)} "
             f"reacquired_total={tracker.cumulative['reacquired']} "
+            f"provisional_replaced_total={tracker.cumulative['provisional_replaced']} "
             f"evicted_total={tracker.cumulative['evicted']} "
             f"evicted_confirmed_total={tracker.cumulative['evicted_confirmed']} "
             f"expired_total={tracker.cumulative['expired']} "

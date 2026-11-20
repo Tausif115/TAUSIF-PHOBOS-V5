@@ -31,7 +31,9 @@ class ReplayScenario:
     radar_hz: float = 120.0
     # Extra radar loop time beyond the nominal sleep (Radar.py sleeps, then
     # works), as a fraction of the nominal period: uniform [0, value].
-    radar_loop_overhead_fraction: float = 0.05
+    # Live run 0555d4ef measured a 4.71 s full sweep for 500 objects, i.e.
+    # ~106 Hz: mean loop overhead ~13 % beyond the 1/120 s sleep.
+    radar_loop_overhead_fraction: float = 0.26
     controller_hz: float = 29.0
     radar_start_s: float = 0.25          # true clock offset (radar t0 in controller time)
     read_lag_max_s: float = 0.006        # radar read happens after t_now sampling
@@ -39,6 +41,7 @@ class ReplayScenario:
     overrun_probability: float = 0.05
     overrun_s: float = 0.12
     stall_windows: list = field(default_factory=list)  # [(start, end)] no controller polls
+    radar_pauses: list = field(default_factory=list)   # [(time, seconds)] radar process hitches
     shuffle_records: bool = False
     seed: int = 7
     position_sigma_m: float = 2.0
@@ -49,6 +52,17 @@ class ReplayScenario:
     shuttle_max_speed_mps: float = 8.0
     shuttle_direction: tuple = (-0.15, 0.02, -0.99)
     debris_speed_range_mps: tuple = (0.5, 4.0)
+    # "live": 75 % uniform 0.5-5 m/s, 25 % uniform 5-10 m/s (live run
+    # 0555d4ef track speeds: median 3.5, p90 6.2, max 10.2 m/s).
+    # "uniform": uniform over debris_speed_range_mps.
+    debris_speed_profile: str = "live"
+    # Radar.py initial snapshot (timestamp 0.0). Live evidence: ~77 % of
+    # snapshot-born tracks failed their first loop update. Modes:
+    # "consistent" (true state at radar start), "zero_velocity" (range-rate
+    # computed as if debris were stationary), "stale" (state from
+    # init_stale_s before radar start).
+    init_snapshot_mode: str = "consistent"
+    init_stale_s: float = 10.0
     # Debris field around the initial path: lateral half-extent and z range.
     field_half_extent_m: float = 350.0
     field_z_range_m: tuple = (-700.0, 300.0)
@@ -69,7 +83,11 @@ class ReplayWorld:
         ))
         direction = rng.normal(size=(n, 3))
         direction /= np.linalg.norm(direction, axis=1)[:, None]
-        speed = rng.uniform(*scenario.debris_speed_range_mps, n)
+        if scenario.debris_speed_profile == "live":
+            fast = rng.random(n) < 0.25
+            speed = np.where(fast, rng.uniform(5.0, 10.0, n), rng.uniform(0.5, 5.0, n))
+        else:
+            speed = rng.uniform(*scenario.debris_speed_range_mps, n)
         self.v = direction * speed[:, None]
         self.diameter = rng.uniform(2.0, 20.0, n)
         self.noise = np.random.default_rng(100 + scenario.seed)  # Radar.py uses its own RNG
@@ -80,6 +98,7 @@ class ReplayWorld:
         return self.p0 + self.v * t, self.v
 
     def shuttle_state(self, t):
+        t = max(0.0, float(t))            # shuttle at rest before the run starts
         a = self.s.shuttle_accel_mps2
         t_burn = self.s.shuttle_max_speed_mps / a
         if t <= t_burn:
@@ -90,11 +109,12 @@ class ReplayWorld:
             speed = self.s.shuttle_max_speed_mps
         return self.heading * distance, self.heading * speed
 
-    def measure(self, index, t, radar_time):
+    def measure(self, index, t, radar_time, stationary_debris=False):
         positions, velocities = self.debris_state(t)
         shuttle_p, shuttle_v = self.shuttle_state(t)
         relative = positions[index] - shuttle_p
-        relative_velocity = velocities[index] - shuttle_v
+        debris_velocity = np.zeros(3) if stationary_debris else velocities[index]
+        relative_velocity = debris_velocity - shuttle_v
         distance = float(np.linalg.norm(relative))
         range_rate = float(np.dot(relative_velocity, relative / distance))
         closest = distance - 0.5 * self.diameter[index]
@@ -119,7 +139,12 @@ def generate_publications(world):
     n = s.num_debris
     sort_frequency = int(n / 10)
     rng = np.random.default_rng(1000 + s.seed)
-    records = [world.measure(i, s.radar_start_s, 0.0) for i in range(n)]
+    if s.init_snapshot_mode == "zero_velocity":
+        records = [world.measure(i, s.radar_start_s, 0.0, stationary_debris=True) for i in range(n)]
+    elif s.init_snapshot_mode == "stale":
+        records = [world.measure(i, s.radar_start_s - s.init_stale_s, 0.0) for i in range(n)]
+    else:
+        records = [world.measure(i, s.radar_start_s, 0.0) for i in range(n)]
     records = [r.copy() for r in records]
     for r in records:
         r[2, 0] = 0.0
@@ -135,8 +160,11 @@ def generate_publications(world):
     t = s.radar_start_s
     iteration = 0
     period = 1.0 / s.radar_hz
+    pauses = sorted(s.radar_pauses)
     while t < s.duration_s + 1.0:
         t += period * (1.0 + rng.uniform(0.0, s.radar_loop_overhead_fraction))
+        while pauses and t >= pauses[0][0]:
+            t += pauses.pop(0)[1]                   # radar loop stalls, then resumes
         index = iteration % n
         records[index] = world.measure(index, t, t - s.radar_start_s)
         if index % sort_frequency == 0:
@@ -221,20 +249,29 @@ def run_replay(scenario, modules, evaluate_every_s=1.0, prefilter=True, new_reco
 
 
 def evaluate_tracks(world, tracker, t, match_radius_m=20.0):
-    """Associate tracks with truth by nearest true object at time t."""
+    """Associate each track with the true object it last measured.
+
+    Matching is done at the track's own last-update time, where its filtered
+    position lies within a few metres of that object, rather than by
+    extrapolating to time t: with debris at up to 10 m/s, an aged track can be
+    extrapolated nearer a different, crossing object, which would mis-label a
+    correct track (Phase A finding). A track with no object within
+    match_radius_m at its own time is a ghost. Errors are evaluated at t.
+    """
     positions, velocities = world.debris_state(t)
     result = {"t": t, "tracks": len(tracker.tracks), "pairs": [], "ghosts": 0}
     owner_counts = {}
     for track in tracker.tracks:
-        predicted = np.asarray(track.position_at(t), dtype=float)
-        distances = np.linalg.norm(positions - predicted, axis=1)
-        nearest = int(np.argmin(distances))
-        # Allow for the track's age (tentative tracks extrapolate an unknown
-        # tangential velocity); 20 m plus 5 m/s of age.
-        allowance = match_radius_m + 5.0 * max(0.0, t - float(track.timestamp))
-        if distances[nearest] > allowance:
+        track_time = float(track.timestamp)
+        objects_then, _ = world.debris_state(track_time)
+        estimate_then = np.asarray(track.position_at(track_time), dtype=float)
+        separation_then = np.linalg.norm(objects_then - estimate_then, axis=1)
+        nearest = int(np.argmin(separation_then))
+        if separation_then[nearest] > match_radius_m:
             result["ghosts"] += 1
             continue
+        predicted = np.asarray(track.position_at(t), dtype=float)
+        distances = np.linalg.norm(positions - predicted, axis=1)
         owner_counts[nearest] = owner_counts.get(nearest, 0) + 1
         velocity_error_vector = np.asarray(track.velocity, dtype=float) - velocities[nearest]
         nees_velocity = float("nan")

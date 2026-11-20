@@ -166,7 +166,15 @@ def test_state_history_bisect_lookup_is_bit_identical_to_phase1():
 
 
 def test_tracker_matches_phase1_reference_on_replays():
+    # Phase A behaviour (provisional snapshot tracks, revisit-p99 expiry,
+    # round-robin revisit gate) is switched off here: this test proves the
+    # Phase 2 performance rewrite is equivalent to Phase 1. Phase A is tested
+    # in test_v5_phase_a.py.
     modules = load_modules(ROOT / "experimental")
+    modules = dict(modules, CONFIG=replace(
+        modules["CONFIG"], track_provisional_init_snapshot=False, track_expiry_mode="legacy",
+        track_min_revisit_fraction=0.0,
+    ))
     reference = dict(modules, DebrisTracker=REFERENCE_TRACKING.DebrisTracker,
                      StateHistory=REFERENCE_TRACKING.StateHistory)
     keys = ("fresh", "matched", "created", "duplicates", "too_soon", "reacquired", "evicted", "expired")

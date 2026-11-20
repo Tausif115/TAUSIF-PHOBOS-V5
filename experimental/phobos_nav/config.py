@@ -60,14 +60,28 @@ class Config:
     # object can never be closer than this; anything closer is a cached copy
     # or a mis-association and must not update a track.
     track_min_update_interval_s: float = 0.25
+    # Phase A: round-robin radar -> once the per-object revisit is measured,
+    # a track may only be updated by a measurement at least this fraction of
+    # a revisit after its previous update (0 disables; live ~3.5 s).
+    track_min_revisit_fraction: float = 0.75
     # Track expiry follows the measured per-object revisit period:
     # max(track_max_age_s, factor * median revisit), capped.
-    track_revisit_expiry_factor: float = 1.3
+    track_revisit_expiry_factor: float = 1.3  # legacy (Phase 1); superseded below
+    # Phase A expiry: publication_factor x p99 measured revisit + margin.
+    # Sweep + one publication interval (sweep/10) is the latest a valid
+    # refresh can arrive; the margin covers radar jitter and controller
+    # overruns and radar-process hitches (live: revisit 4.71 s -> expiry ~5.8 s).
+    track_expiry_mode: str = "revisit_p99"   # "legacy" = Phase 1 rule (tests only)
+    track_expiry_publication_factor: float = 1.1
+    track_expiry_margin_s: float = 0.60
     track_revisit_min_samples: int = 50
     track_max_age_cap_s: float = 9.0
     # An unassociated observation may re-acquire an overdue track (one that
     # missed its expected revisit) instead of spawning a duplicate.
     track_reacquire_min_fraction: float = 0.75
+    # Phase A: tracks born from Radar.py's initial snapshot (raw time 0.0)
+    # are provisional and replaced by their first loop measurement.
+    track_provisional_init_snapshot: bool = True
     radar_seen_key_retention_s: float = 15.0
     # V5 Phase 2b: at most this many unseen radar records are decoded per
     # tick (nearest first); the rest wait one tick. Steady state brings

@@ -94,6 +94,11 @@ class DebrisTrack:
     range_rate: float = 0.0
     # V5: 6x6 state covariance [position, velocity] in Phobos axes.
     covariance: np.ndarray | None = None
+    # V5 Phase A: born from Radar.py's initial snapshot (raw timestamp 0.0),
+    # whose epoch/state is not consistent with runtime measurements (live
+    # run 0555d4ef: ~77 % of such tracks failed their first loop update).
+    # A provisional track is replaced by its first loop measurement.
+    provisional: bool = False
 
     def position_at(self, timestamp):
         dt = float(timestamp) - self.timestamp
@@ -141,7 +146,7 @@ class DebrisTracker:
         self.deferred_new_records = 0
         self.last_update_stats = {}
         self.cumulative = {
-            "evicted": 0, "evicted_confirmed": 0, "reacquired": 0,
+            "evicted": 0, "evicted_confirmed": 0, "reacquired": 0, "provisional_replaced": 0,
             "expired": 0, "replays": 0, "velocity_clamped": 0,
         }
 
@@ -179,14 +184,33 @@ class DebrisTracker:
         return float(np.median(np.asarray(self._revisit_samples, dtype=float)))
 
     def expiry_age_s(self):
+        """Age beyond which a track has certainly missed its radar refresh.
+
+        Radar.py refreshes each object once per sweep and republishes every
+        sweep/10 (sortFrequency = N/10), so a correctly tracked object is at
+        most ~sweep + sweep/10 + one controller poll old. Phase A: expiry is
+        `track_expiry_publication_factor` x p99 measured revisit plus
+        `track_expiry_margin_s` (radar jitter, controller overruns). Before
+        revisits are measured (startup) track_max_age_s applies. The result
+        never exceeds track_max_age_cap_s; it can exceed track_max_age_s if
+        the radar itself is that slow (coverage first).
+        """
         base = float(self.config.track_max_age_s)
-        revisit = self.revisit_period_s()
-        if not np.isfinite(revisit):
+        if len(self._revisit_samples) < int(self._cfg("track_revisit_min_samples", 50)):
             return base
-        return float(min(
-            max(base, float(self._cfg("track_revisit_expiry_factor", 1.3)) * revisit),
-            max(base, float(self._cfg("track_max_age_cap_s", 9.0))),
-        ))
+        if self._cfg("track_expiry_mode", "revisit_p99") == "legacy":
+            # Phase 1 rule, kept for regression comparison only.
+            revisit = float(np.median(np.asarray(self._revisit_samples, dtype=float)))
+            return float(min(
+                max(base, float(self._cfg("track_revisit_expiry_factor", 1.3)) * revisit),
+                max(base, float(self._cfg("track_max_age_cap_s", 9.0))),
+            ))
+        revisit_p99 = float(np.percentile(np.asarray(self._revisit_samples, dtype=float), 99.0))
+        bound = (
+            float(self._cfg("track_expiry_publication_factor", 1.1)) * revisit_p99
+            + float(self._cfg("track_expiry_margin_s", 0.60))
+        )
+        return float(min(bound, float(self._cfg("track_max_age_cap_s", 9.0))))
 
     def _default_position_covariance(self):
         sigma = float(self._cfg("radar_position_sigma_m", 2.0))
@@ -368,7 +392,12 @@ class DebrisTracker:
                     else vec3(obs_shuttle_velocity)
                 )
                 position_cov = obs                  # resolved in bulk below
+                raw_time = getattr(obs, "raw_timestamp", None)
                 valid.append({
+                    "provisional": bool(
+                        self._cfg("track_provisional_init_snapshot", True)
+                        and raw_time is not None and float(raw_time) == 0.0
+                    ),
                     "position": position,
                     "diameter": diameter,
                     "range_rate": range_rate,
@@ -392,7 +421,7 @@ class DebrisTracker:
 
         if self.tracks and valid:
             assigned, replay, coarse_candidates = self._associate(
-                valid, min_interval, psd, chi2_gate
+                valid, min_interval, psd, chi2_gate, revisit
             )
 
         matched_count = 0
@@ -416,13 +445,18 @@ class DebrisTracker:
             track.timestamp = item["time"]
             track.hits += 1
             track.confirmed = track.hits >= cfg.confirmation_hits
-            self._revisit_samples.append(dt)
+            # Snapshot-to-first-measurement intervals (uniform over one sweep)
+            # are not revisits; including them biased the revisit estimate low.
+            if not track.provisional:
+                self._revisit_samples.append(dt)
+            track.provisional = False
             updated_tracks.add(ti)
             matched_count += 1
 
         assigned_observations = {oi for _, oi, _ in assigned}
         created_count = 0
         reacquired_count = 0
+        provisional_replaced = 0
         evicted_count = 0
         evicted_confirmed = 0
         replay_count = 0
@@ -449,10 +483,16 @@ class DebrisTracker:
             )
 
             # Re-acquire the nearest overdue track instead of creating a
-            # duplicate that would leave the old track as a ghost.
+            # duplicate that would leave the old track as a ghost. "Overdue"
+            # means it missed its expected revisit (track_reacquire_min_fraction
+            # x measured revisit); a track still due for its own measurement
+            # must not be taken over. A provisional (initial-snapshot) track
+            # may be replaced by any later loop measurement of its object.
             reacquire_index = None
             for distance, ti, dt in self._coarse_candidates_for(coarse_candidates, oi):
-                if ti in updated_tracks or ti in evicted or dt < reacquire_after:
+                if ti in updated_tracks or ti in evicted or dt < min_interval:
+                    continue
+                if not (self.tracks[ti].provisional or dt >= reacquire_after):
                     continue
                 reacquire_index = ti
                 break
@@ -466,8 +506,12 @@ class DebrisTracker:
                 track.timestamp = item["time"]
                 track.hits = 1
                 track.confirmed = False
+                if track.provisional:
+                    provisional_replaced += 1
+                else:
+                    reacquired_count += 1
+                track.provisional = item["provisional"]
                 updated_tracks.add(reacquire_index)
-                reacquired_count += 1
                 continue
 
             if len(self.tracks) - len(evicted) + len(new_tracks) >= cfg.max_tracks:
@@ -491,6 +535,7 @@ class DebrisTracker:
                     confirmed=False,
                     range_rate=item["range_rate"],
                     covariance=covariance,
+                    provisional=item["provisional"],
                 )
             )
             self.next_identifier += 1
@@ -504,12 +549,19 @@ class DebrisTracker:
 
         # Expire AFTER association: after a controller stall, a track's fresh
         # measurement may be in this very batch and must be used, not lost.
+        # Genuine revisit samples exist only once objects have been measured
+        # twice by the radar loop, i.e. after the first full sweep. Every
+        # object has then had a loop measurement, so a provisional
+        # (initial-snapshot) track still present was never matched by its
+        # object: it is a snapshot artefact, not a missed object.
+        sweep_complete = np.isfinite(self.revisit_period_s())
         before = len(self.tracks)
         self.tracks = [
             track for track in self.tracks
             if -cfg.future_timestamp_tolerance_s
             <= timestamp - track.timestamp
             <= expiry
+            and not (sweep_complete and track.provisional)
         ]
         expired_count = before - len(self.tracks)
         self.cumulative["expired"] += expired_count
@@ -530,6 +582,7 @@ class DebrisTracker:
         self.cumulative["evicted"] += evicted_count
         self.cumulative["evicted_confirmed"] += evicted_confirmed
         self.cumulative["reacquired"] += reacquired_count
+        self.cumulative["provisional_replaced"] += provisional_replaced
         self.cumulative["replays"] += replay_count
         self.cumulative["velocity_clamped"] += clamped_count
 
@@ -546,6 +599,7 @@ class DebrisTracker:
             "matched": matched_count,
             "created": created_count,
             "reacquired": reacquired_count,
+            "provisional_replaced": provisional_replaced,
             "evicted": evicted_count,
             "evicted_confirmed": evicted_confirmed,
             "expired": expired_count,
@@ -561,7 +615,7 @@ class DebrisTracker:
 
     # ------------------------------------------------------------------
     def _eviction_index(self, timestamp, revisit, protected):
-        """Least valuable track: overdue first, then fewest hits, then oldest."""
+        """Least valuable track: provisional, then overdue, then fewest hits, then oldest."""
         overdue_after = (
             revisit if np.isfinite(revisit)
             else float(self.config.track_max_age_s) / 1.3
@@ -571,7 +625,14 @@ class DebrisTracker:
             if index in protected:
                 continue
             age = timestamp - float(track.timestamp)
-            key = (0 if age > overdue_after else 1, int(track.hits), -age)
+            # Provisional snapshot placeholders first, then overdue tracks,
+            # then fewest hits, then oldest.
+            key = (
+                0 if track.provisional else 1,
+                0 if age > overdue_after else 1,
+                int(track.hits),
+                -age,
+            )
             if best is None or key < best[0]:
                 best = (key, index)
         return None if best is None else best[1]
@@ -594,7 +655,7 @@ class DebrisTracker:
             covariances.append(covariance)
         return np.asarray(covariances, dtype=float)
 
-    def _associate(self, valid, min_interval, psd, chi2_gate):
+    def _associate(self, valid, min_interval, psd, chi2_gate, revisit=float("nan")):
         cfg = self.config
         track_positions = np.asarray([t.position for t in self.tracks], dtype=float)
         track_velocities = np.asarray([t.velocity for t in self.tracks], dtype=float)
@@ -681,7 +742,27 @@ class DebrisTracker:
         replay = set(
             obs_index[statistically_valid & (dt < min_interval)].tolist()
         )
-        assignable = statistically_valid & (dt >= min_interval)
+        # Official Radar.py refreshes object `iteration % numDebris` of an
+        # unsorted list (strict round-robin), so the same object is measured
+        # again only after ~one full sweep; jitter averages out over the sweep
+        # and hitches only lengthen it. Once the revisit is measured, a pairing
+        # sooner than track_min_revisit_fraction x revisit cannot be the same
+        # object and may not update that track (Phase A: replay seed 100, an
+        # 8.3 m/s object's measurement was assigned to a track updated 2.47 s
+        # earlier, corrupting it and orphaning the object's own track). The
+        # measurement stays available to its own track; it is not a replay.
+        # Provisional snapshot tracks are exempt (first loop update any time).
+        pair_interval = np.full(dt.shape, float(min_interval))
+        if np.isfinite(revisit):
+            provisional = np.fromiter(
+                (self.tracks[ti].provisional for ti in track_index.tolist()),
+                dtype=bool, count=len(track_index),
+            )
+            pair_interval = np.where(
+                provisional, pair_interval,
+                np.maximum(pair_interval, float(self._cfg("track_min_revisit_fraction", 0.75)) * revisit),
+            )
+        assignable = statistically_valid & (dt >= pair_interval)
         pair_rows = track_index[assignable]
         pair_cols = obs_index[assignable]
         pair_costs = (d2 + logdet)[assignable]

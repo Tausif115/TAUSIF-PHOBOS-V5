@@ -1,7 +1,10 @@
-Phobos Escape Controller V5.0-dev (Phases 0-2b: deployment safety, radar/tracker integrity, offline performance, 60 Hz deadline scheduling)
+Phobos Escape Controller V5.0-dev (Phases 0-2b committed; Phase A tracker retuning in working tree)
 Log tag: PHOBOS_NAV_V50
 
 Based on: V4.3 500-debris validation candidate (../V43-BASELINE, unmodified).
-Status: offline tests and offline benchmarks only. NOT deployed.
-Live STPro validation NOT YET PERFORMED.
+Deployed to STPro: commit ccfaf61 (Phases 0-2b) only. Phase A is NOT deployed.
+Live STPro: one 25 s run of ccfaf61 on COMPETITION_SIM_500_RADAR_VALIDATION
+(run 0555d4ef). Short-check gate A NOT passed (track age max 6.19 s; 550 cap hit
+at startup). Phase A addresses the tracker findings; offline-verified only.
+Not yet tested against FINAL_SUBMISSION.simconf (not available locally).
 Fuel, guidance, planner and actuator parameters are unchanged from V4.3.

@@ -1,3 +1,63 @@
+# V5.0-dev — Phase A (tracker retuning from live run 0555d4ef, offline)
+
+Offline-verified only. Not deployed, not run in STPro. Planner, guidance and
+actuator behaviour unchanged.
+
+## Live findings addressed (run 0555d4ef, commit ccfaf61)
+- 550 cap hit at startup, 659 IDs for 500 objects, 615 re-acquisitions, 66
+  evictions: ~77 % of tracks born from Radar.py's initial snapshot (raw
+  timestamp 0.0) failed their first loop update and were duplicated.
+- track_age_max 6.19 s (> 6.0 criterion): orphaned/duplicate tracks aging out
+  at expiry = max(6.0, 1.3 x 4.71 s revisit) = 6.12 s.
+
+## Changes (`tracking.py`, `config.py`)
+- Provisional tracks (`track_provisional_init_snapshot`, default on): tracks
+  born from raw-timestamp-0 records are replaced by their object's first loop
+  measurement (counted `provisional_replaced`, not as re-acquisition); evicted
+  first at capacity; removed once the first sweep is complete. Their
+  snapshot-to-first-measurement interval is excluded from the revisit
+  estimate.
+- Expiry = 1.1 x p99 measured revisit + 0.60 s (`track_expiry_mode`
+  "revisit_p99"; "legacy" = Phase 1 rule, tests only). Live revisit 4.71 s ->
+  5.78 s. A valid track is at most sweep + sweep/10 + one poll (~5.2 s) old.
+  6.0 s before revisits are measured; capped at 9.0 s.
+- Round-robin association gate (`track_min_revisit_fraction` 0.75): official
+  Radar.py refreshes `iteration % numDebris` of an unsorted list, so a track
+  cannot be updated by a measurement sooner than 0.75 x measured revisit
+  (~3.5 s live). Fixes fast-debris mis-association found in replay seed 100
+  (an 8.3 m/s object's revisit stolen by a track updated 2.47 s earlier).
+  Provisional tracks exempt.
+- Unchanged after evaluation: tangential prior 5 m/s (10 m/s raised clamps,
+  duplicates and expiries), speed bound 15 m/s (25 m/s only hid clamps),
+  re-acquisition fraction 0.75.
+- `Controller.py`: log field `provisional_replaced_total` (logging only).
+
+## Replay harness (`tests/radar_replay.py`)
+- Live debris speed mix (75 % 0.5-5 m/s, 25 % 5-10 m/s), radar loop overhead
+  0.26 (~106 Hz, as live), initial-snapshot modes consistent / zero_velocity
+  / stale, radar hitch injection.
+- Evaluator matches each track to truth at the track's own last-update time
+  (extrapolated matching mislabelled correct tracks near crossing fast debris).
+
+## Offline results (12 SpawnDebris-style seeds: 100, 1-11; 30 s; worst [mean])
+| init snapshot | config | 550 cap hit | IDs | evictions | expiries | age max s |
+|---------------|--------|-------------|-----|-----------|----------|-----------|
+| consistent    | ccfaf61 | 0/12 | 502 [500] | 0 | 2 [0.25] | 6.09 [5.25] |
+| consistent    | Phase A | 0/12 | 500 [500] | 0 | 0 | 5.19 [5.18] |
+| zero_velocity | ccfaf61 | 12/12 | 743 [723] | 184 [165] | 66 [58] | 6.12 [5.82] |
+| zero_velocity | Phase A | 0/12 | 506 [503] | 0 | 6 [2.8] | 5.80 [5.28] |
+| stale (10 s)  | ccfaf61 | 12/12 | 748 [731] | 191 [169] | 73 [62] | 6.12 [5.90] |
+| stale (10 s)  | Phase A | 12/12 | 648 [635] | 94 [80] | 62 [55] | 5.75 [5.30] |
+Stale: cap still reached during the first sweep; only placeholders evicted
+(0 confirmed evictions), full 500-object coverage in every run.
+`tracker.update` cost unchanged (p50 3.1 ms both). Pipeline benchmark: 0
+ticks over 16.67 ms (sparse and dense).
+
+## Tests
+- `tests/test_v5_phase_a.py` (13 tests). Phase 1 equivalence test runs with
+  Phase A disabled. Healthy-replay speed bound follows true debris speed.
+  Suite: 82 passed.
+
 # V5.0-dev — Phase 2b (60 Hz deadline engineering, offline)
 
 Offline-benchmarked only. Not deployed. No live STPro timing exists for V5.
