@@ -109,6 +109,13 @@ def main():
             fuel_at["dv"] = bench.world.delta_v_shuttle
         original_alert(message, tag)
     bench.record_alert = alert_hook
+    fault_stats = None
+    if args.pilot == "controller" and opts.get("tracker_faults") is not None:
+        # live-like tracker faults (test-only wrapper around the real tracker)
+        sys.path.insert(0, str(pathlib.Path(args.controller_dir) / "experimental"))
+        import phobos_nav.tracking as _tracking
+        import tracker_faults
+        fault_stats = tracker_faults.install(_tracking, opts["tracker_faults"])
     bench.run()
 
     w = bench.world
@@ -135,6 +142,7 @@ def main():
         collision_detail=[(round(c[0], 2), c[1], round(c[2], 2)) for c in contacts[:20]],
         min_debris_clearance_m=float(finite.min()) if finite.size else None,
         target_min_range_m=w.target_min_range, target_contact_t=w.target_contact_t,
+        pad_max_drop_m=w.max_drop, tracker_faults=fault_stats,
         speed_at_latch=None, wall_s=round(_time.time() - wall0, 1),
         refap_log=[m for _, tag, m in bench.logs if tag == "RefAP"][:40],
     )

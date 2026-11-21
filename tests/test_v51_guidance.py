@@ -66,8 +66,11 @@ def test_waits_for_confirmed_tracks_then_burns_then_coasts_with_zero_command():
     guide = FlybyGuidance(CONFIG, MU)
     tracks = _tracks([[2000.0, 2000.0, -8000.0]])
     accel, metrics = guide.update(1.0, SHUTTLE, np.zeros(3), TARGET, tracks, True, True, _clock)
-    assert guide.phase == "WAIT" and np.all(accel == 0.0) and metrics["safety_state"] == "LAUNCH_WAIT"
-    accel, _ = guide.update(12.0, SHUTTLE, np.zeros(3), TARGET, tracks, True, True, _clock)
+    assert guide.phase == "WAIT" and metrics["safety_state"] == "LAUNCH_WAIT"
+    assert np.linalg.norm(accel) <= CONFIG.v51_wait_max_cmd + 1e-12      # gravity hold only
+    guide.update(12.0, SHUTTLE, np.zeros(3), TARGET, tracks, True, True, _clock)
+    assert guide.phase == "WAIT"                                          # must stay ready for 1 s
+    accel, _ = guide.update(13.1, SHUTTLE, np.zeros(3), TARGET, tracks, True, True, _clock)
     assert guide.phase == "BURN" and np.linalg.norm(accel) > 0.0
     burn_dir = accel / np.linalg.norm(accel)
     assert burn_dir @ ((TARGET - SHUTTLE) / np.linalg.norm(TARGET - SHUTTLE)) > 0.99
@@ -80,13 +83,14 @@ def test_no_launch_on_stale_radar():
     guide = FlybyGuidance(CONFIG, MU)
     tracks = _tracks([[2000.0, 2000.0, -8000.0]])
     accel, _ = guide.update(40.0, SHUTTLE, np.zeros(3), TARGET, tracks, False, False, _clock)
-    assert guide.phase == "WAIT" and np.all(accel == 0.0)
+    assert guide.phase == "WAIT" and np.linalg.norm(accel) <= CONFIG.v51_wait_max_cmd + 1e-12
 
 
 def test_debris_on_coast_path_triggers_smallest_clearing_avoidance():
     guide = FlybyGuidance(CONFIG, MU)
     far = _tracks([[2000.0, 2000.0, -8000.0]])
     guide.update(12.0, SHUTTLE, np.zeros(3), TARGET, far, True, True, _clock)
+    guide.update(13.1, SHUTTLE, np.zeros(3), TARGET, far, True, True, _clock)
     v = guide.v_target.copy()
     guide.update(80.0, SHUTTLE, v, TARGET, far, True, True, _clock)        # coasting, clear
     assert guide.phase == "COAST"
@@ -98,9 +102,57 @@ def test_debris_on_coast_path_triggers_smallest_clearing_avoidance():
         p = p + vel * 0.1
     tracks = _tracks([p], diameters=[20.0])
     guide.next_check = 0.0
-    accel, metrics = guide.update(81.0, SHUTTLE, v, TARGET, tracks, True, True, _clock)
+    guide.update(81.0, SHUTTLE, v, TARGET, tracks, True, True, _clock)   # first sighting
+    assert guide.phase == "COAST"                                        # persistence required
+    guide.next_check = 0.0
+    accel, metrics = guide.update(82.0, SHUTTLE, v, TARGET, tracks, True, True, _clock)
     assert guide.phase == "AVOID" and metrics["avoidance_active"]
     assert np.linalg.norm(accel) > 0.0
     dv = guide.v_target - v
     assert 0.0 < np.linalg.norm(dv) <= max(CONFIG.v51_avoid_magnitudes)
     assert guide.counts["emergencies"] == 0
+
+
+def test_wait_hold_cancels_fall_with_proportional_commands():
+    guide = FlybyGuidance(CONFIG, MU)
+    up = (TARGET - SHUTTLE) / np.linalg.norm(TARGET - SHUTTLE)
+    falling = -0.05 * up                                   # sinking toward the pad
+    accel, _ = guide.update(5.0, SHUTTLE, falling, TARGET, _tracks(), True, False, _clock)
+    assert guide.phase == "WAIT"
+    assert accel @ up > 0.0                                # pushes back up
+    assert np.linalg.norm(accel) <= CONFIG.v51_wait_max_cmd + 1e-12   # proportional regime
+    accel, _ = guide.update(5.1, SHUTTLE, CONFIG.v51_wait_hold_speed_mps * up, TARGET, _tracks(), True, False, _clock)
+    assert np.linalg.norm(accel) < 1e-12                   # at the hold velocity: no thrust
+
+
+def test_implausible_velocity_track_is_reset_to_measured_position():
+    guide = FlybyGuidance(CONFIG, MU)
+    p = SHUTTLE + np.array([60.0, 0.0, 0.0])
+    ts = _tracks([p], velocities=[[-8.0, 0.0, 0.0]])      # corrupted: 8 m/s toward the shuttle
+    ts.ages[:] = 3.0                                       # measured 3 s ago
+    r = guide._reliable(ts, 40.0)
+    assert guide.implausible == 1 and not r.confirmed[0]
+    np.testing.assert_allclose(r.velocities[0], 0.0)
+    np.testing.assert_allclose(r.positions[0], p + np.array([24.0, 0.0, 0.0]))   # extrapolation undone
+    ok = guide._reliable(_tracks([p], velocities=[[1.0, 0.0, 0.0]]), 40.0)
+    assert guide.implausible == 0 and ok.confirmed[0]
+
+
+def test_distant_unclearable_conflict_does_not_trigger_emergency_dodge():
+    guide = FlybyGuidance(CONFIG, MU)
+    far = _tracks([[2000.0, 2000.0, -8000.0]])
+    guide.update(12.0, SHUTTLE, np.zeros(3), TARGET, far, True, True, _clock)
+    guide.update(13.1, SHUTTLE, np.zeros(3), TARGET, far, True, True, _clock)
+    v = guide.v_target.copy()
+    guide.update(80.0, SHUTTLE, v, TARGET, far, True, True, _clock)
+    dyn = guide.dyn
+    p, vel = SHUTTLE.copy(), v.copy()
+    for _ in range(700):                                   # ~70 s ahead
+        vel = vel + np.array(dyn.accel(*p, *vel)) * 0.1
+        p = p + vel * 0.1
+    wall = _tracks([p], diameters=[400.0])                 # cannot be cleared by any candidate
+    for t in (81.0, 82.0, 83.0):
+        guide.next_check = 0.0
+        accel, _ = guide.update(t, SHUTTLE, v, TARGET, wall, True, True, _clock)
+    assert guide.phase == "COAST" and np.all(accel == 0.0)
+    assert guide.counts["emergencies"] == 0 and guide.counts["deferred_emergencies"] >= 1

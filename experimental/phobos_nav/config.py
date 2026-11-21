@@ -198,7 +198,10 @@ class Config:
     v51_slowdown_cost: float = 1.5
     v51_avoid_commit_s: float = 8.0
     v51_tracks_ready_fraction: float = 0.9
-    v51_launch_confirmed_fraction: float = 0.95
+    # V5.2: live confirmed fraction plateaus at 93-94 % (tracker reacquisitions);
+    # 0.95 was unreachable live (launch fell back to 30 s). Must hold for 1 s.
+    v51_launch_confirmed_fraction: float = 0.90
+    v51_launch_stable_s: float = 1.0
     v51_max_launch_wait_s: float = 30.0
     v51_action_horizon_s: float = 90.0
     v51_far_cost_cap: float = 1.0e9
@@ -206,6 +209,20 @@ class Config:
     v51_urgent_s: float = 25.0
     v51_reaim_cost: float = 1.0
     v51_fold_cost: float = 1.0
+    # V5.2 (live run bde2f2fb fixes)
+    # WAIT gravity hold: per-tick commands below ~dt*authority are delivered
+    # proportionally by the official actuator (per-tick dv == command).
+    v51_wait_hold: bool = True
+    v51_wait_hold_speed_mps: float = 0.01     # small climb, away from the pad
+    v51_wait_gain: float = 0.2                # fraction of velocity error per tick
+    v51_wait_max_cmd: float = 0.0015          # stays in the proportional regime
+    # physical debris speed bound: SpawnDebris start <= 0.8 m/s + fall ~0.0105 t
+    v51_plausible_speed_mps: float = 1.5
+    v51_plausible_speed_rate: float = 0.015
+    v51_tentative_horizon_s: float = 25.0     # unreliable tracks guard only the near term
+    v51_emergency_horizon_s: float = 20.0     # no blind (non-clearing) dodge for later conflicts
+    v51_persist_checks: int = 2               # consecutive conflict checks before acting...
+    v51_immediate_s: float = 8.0              # ...unless the conflict is this close
     v51_terminal_zone_m: float = 400.0
     v51_ca_min_m: float = 20.0
 

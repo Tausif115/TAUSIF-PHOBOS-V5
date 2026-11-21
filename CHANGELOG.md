@@ -1,3 +1,63 @@
+# V5.2-dev — live-run fixes (offline bench only; NOT deployed, no STPro run)
+
+## Why: live V5.1 run bde2f2fb (STPro, validation simconf, 57 s) FAILED
+- Unpowered WAIT: shuttle sank under gravity (-0.0118 m/s^2), touched the pad at
+  t=16.2 s (-1.45 m), settled at -2.1 m; damage 42.6 + 2.6 + 0.4 = 45.6 J.
+- Launch gate (95 % confirmed tracks) unreachable live (plateau 93-94 %, ~6.5
+  reacquisitions/s) -> 30 s fallback.
+- Emergency dodges against tracker artefacts: conflict 90 s ahead (no clearing
+  candidate) and a track extrapolated with a corrupted velocity (passed 1.96 m
+  from the shuttle, no damage, closing ~6 m/s); 3.6 of 3.9 m/s planned dv sideways.
+
+## Fixes (`experimental/phobos_nav/ballistic.py`, `config.py`)
+1. WAIT gravity hold: per-tick command = 0.2 x (0.01 m/s up - velocity), capped at
+   0.0015. JetSelectionActuator delivers commands below ~dt x authority
+   proportionally (on-time = LP solution < one tick), so per-tick dv == command;
+   steady state 0.0002 = g/60.
+2. Launch gate 0.90 confirmed, held for 1 s (fallback 30 s unchanged).
+3. Phantom robustness: tracks faster than 1.5 + 0.015 t m/s (physical bound from
+   SpawnDebris + gravity fall) are reset to their last measured position with zero
+   velocity and treated as tentative; tentative tracks guard only 25 s ahead;
+   conflicts must persist 2 checks unless <= 8 s away; no non-clearing (emergency)
+   dodge for conflicts > 20 s away; a dodge stops once coasting is clear.
+- Log tag PHOBOS_NAV_V52; new fields v52_implausible, v52_deferred_emerg, v52_aborts.
+- Not changed: burn-phase re-aim policy (known cost issue, see below).
+
+## Bench additions (test-only)
+- `tests/missionbench/tracker_faults.py`: live-calibrated tracker faults
+  (reacquisitions 6.5/s with ~1 m/s/axis velocity error, implausible-velocity
+  tracks 0.35/s, optional phantoms aimed at the shuttle).
+- Pad proxy `pad_max_drop_m` (max sink toward Phobos; live contact at ~1.4 m).
+- SpawnDebris test copy follows the official seed line (100 -> 8193).
+
+## Offline results, 95 missions (bench predictions, not competition results)
+Bench seed 100 = FINAL debris (baked positions + official seed 8193).
+| class | ver | runs | success, 0 collisions | score median / mean | worst / best | fuel median (max) | max sink |
+|---|---|---|---|---|---|---|---|
+| FINAL clean | V5.2 | 1 | 1 | 47.4 | - | 38.5 kg | 0.01 m |
+| FINAL clean | V5.1 | 1 | 1 | 46.7 | - | 39.0 kg | 0.75 m |
+| FINAL + faults (+phantoms) | V5.2 | 6 | 6 | 37.5 / 39.6 | 35.6 / 45.7 | 46.5 (47.9) kg | 0.01 m |
+| FINAL + faults (+phantoms) | V5.1 | 6 | 5 | -98.1 / -101.7 | -143.7 / -59.8 | 130.6 (168.8) kg | >= 5.3 m |
+| 20 seeds clean | V5.2 | 20 | 20 | 38.4 / 37.5 | 3.9 / 49.1 | 45.3 (72.6) kg | 0.01 m |
+| 20 seeds clean | V5.1 | 20 | 20 | 38.6 / 38.9 | 20.5 / 49.7 | ~45 kg | ~0.75 m |
+| 20 seeds + faults | V5.2 | 20 | 20 | 27.7 / 24.6 | -12.7 / 46.8 | 52.9 (85.5) kg | 0.01 m |
+| 20 seeds + faults | V5.1 | 20 | 16 | -56.6 / -65.7 | -146.7 / -5.0 | 110 (177) kg | >= 5.3 m |
+| 3 large threats + faults | V5.2 | 11 | 10 | 23.3 / 15.9 | -10.8 / 37.2 | 57.5 (83.4) kg | 0.01 m |
+- Phantoms (3 per run): V5.2 output identical to the same runs without phantoms.
+- Launch 11.8-12.5 s in the bench; live confirmation is slower (90 % at 19.3 s
+  in bde2f2fb) -> expected live launch ~20 s (~ -2 points).
+- Ascent: V5.2 hold keeps vertical speed +0.009 m/s; burn upward acceleration
+  0.096-0.113 m/s^2 (bench) vs 0.092-0.102 m/s^2 measured live (V5.1).
+- Remaining V5.2 collision: threats+faults seed 10 (t=175 s, injected large
+  threat, 8 m/s): fault-corrupted velocity on that track at closest approach;
+  passes without faults (30.5); V5.2 gates were not involved (dodges at 25/13/6 s).
+- Known cost issue (not fixed): burn-phase re-aims are accepted without a dv
+  comparison; usually ~free (median burn fuel 39.9 vs 39.4 kg) but chains late in
+  the burn cost up to +32 kg (seed 17 clean: 71.9 kg burn, score 3.9).
+
+## Tests
+91 passed (V5.1 tests updated for the hold/persistence; 3 new V5.2 tests).
+
 # V5.1-dev — fly-by guidance (offline bench only; NOT deployed, no STPro run)
 
 ## Guidance (`experimental/phobos_nav/ballistic.py`, wired in `Controller.py`)

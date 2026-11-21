@@ -181,6 +181,8 @@ class World:
         self.contacts = []                   # (t, body, rel_speed)
         self.target_min_range = np.inf
         self.target_contact_t = None
+        self.start_r = None                  # pad proxy: max sink toward Phobos from start
+        self.max_drop = 0.0
         self.synced_p, self.synced_v = self.p.copy(), self.v.copy()
         self.last_sync = 0.0
         self.trace = []                      # (t, p_shuttle, v_shuttle) at 1 Hz
@@ -260,6 +262,10 @@ class World:
         rng = float(np.linalg.norm(self.target_position - self.p[0]))
         if rng < self.target_min_range:
             self.target_min_range = rng
+        r = float(np.linalg.norm(self.p[0]))
+        if self.start_r is None:
+            self.start_r = r
+        self.max_drop = max(self.max_drop, self.start_r - r)
         if rng < self.target_radius + self.radius[0] and self.target_contact_t is None:
             self.target_contact_t = self.t
 
@@ -534,14 +540,17 @@ def spawn_debris_copy(seed, workdir, hunting=False):
     if requested, the hunting flag) changed; verified line-by-line."""
     src = ASSETS / "Repos" / "STU4-Sim" / "Systems" / "SpawnDebris.py"
     text = open(src, encoding="utf-8").read()
-    assert text.count("\nseed = 100\n") == 1
-    new = text.replace("\nseed = 100\n", f"\nseed = {int(seed)}\n")
+    import re
+    found = re.findall(r"\nseed = (\d+)\n", text)   # official: 100 until 2026-11-11, then 8193
+    assert len(found) == 1
+    official_seed = int(found[0])
+    new = text.replace(f"\nseed = {official_seed}\n", f"\nseed = {int(seed)}\n")
     if hunting:
         assert new.count("doTrajectoryAdjustment = False") == 1
         new = new.replace("doTrajectoryAdjustment = False", "doTrajectoryAdjustment = True")
     a, b = text.splitlines(), new.splitlines()
     changed = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
-    assert len(a) == len(b) and len(changed) == (2 if hunting else (0 if seed == 100 else 1))
+    assert len(a) == len(b) and len(changed) == (2 if hunting else (0 if seed == official_seed else 1))
     out = pathlib.Path(workdir) / f"SpawnDebris_seed{int(seed)}{'_hunting' if hunting else ''}.py"
     out.write_text(new, encoding="utf-8")
     return out

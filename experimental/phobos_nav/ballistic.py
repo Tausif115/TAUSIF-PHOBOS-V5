@@ -142,6 +142,33 @@ class FlybyGuidance:
         self.next_solve = 0.0
         self.committed_until = -1.0
         self.resume_burn_target = None
+        self.ready_since = None
+        self.conflict_streak = 0
+        self.implausible = 0
+        self.counts.update({"deferred_emergencies": 0, "aborts": 0})
+
+    # ------------------------------------------------------- track reliability
+    def _reliable(self, ts, t):
+        """V5.2: a track whose speed exceeds the physical bound (SpawnDebris
+        start speed + gravity fall, with margin) has a corrupted velocity
+        (live run bde2f2fb: mis-association / reacquisition). Its extrapolated
+        position is then garbage too, so it is reset to the last measured
+        position with zero velocity and treated as tentative (growing
+        uncertainty ball, short guard horizon)."""
+        c = self.c
+        s = self._subset(ts, slice(None))
+        v = np.array(ts.velocities, dtype=float).reshape(-1, 3)
+        p = np.array(ts.positions, dtype=float).reshape(-1, 3)
+        ages = np.asarray(ts.ages, dtype=float).reshape(-1)
+        cap = c.v51_plausible_speed_mps + c.v51_plausible_speed_rate * max(float(t), 0.0)
+        bad = np.linalg.norm(v, axis=1) > cap
+        self.implausible = int(bad.sum())
+        if bad.any():
+            p[bad] = p[bad] - v[bad] * ages[bad, None]
+            v[bad] = 0.0
+        s.positions, s.velocities = p, v
+        s.confirmed = np.asarray(ts.confirmed, dtype=bool).reshape(-1) & ~bad
+        return s
 
     # ---------------------------------------------------------------- predict
     def _debris_grid(self, ts, dt, steps):
@@ -171,6 +198,10 @@ class FlybyGuidance:
         diff = grid[None, :, :, :] - paths[:, :, None, :]       # (K, S+1, N, 3)
         dist = np.sqrt(np.einsum("ksnd,ksnd->ksn", diff, diff))
         clear = dist - radii[None, None, :] - margin[None, :, :]
+        tentative = ~np.asarray(ts.confirmed, dtype=bool)
+        if tentative.any():   # V5.2: unreliable tracks only guard the near term
+            beyond = times > self.c.v51_tentative_horizon_s
+            clear = np.where((beyond[:, None] & tentative[None, :])[None], np.inf, clear)
         flat = clear.reshape(clear.shape[0], -1)
         idx = np.argmin(flat, axis=1)
         return flat[np.arange(len(idx)), idx], idx // clear.shape[2], idx % clear.shape[2]
@@ -296,10 +327,17 @@ class FlybyGuidance:
         if self.phase != "LATCHED" and rng <= c.capture_radius_m:
             self.phase, self.v_target = "LATCHED", None
 
+        confirmed = float(np.mean(ts.confirmed)) if len(ts.positions) else 0.0
+        ts = self._reliable(ts, t)
+
         if self.phase == "WAIT":
-            confirmed = float(np.mean(ts.confirmed)) if len(ts.positions) else 0.0
-            ready = (radar_ok and tracks_ready and t >= c.v51_min_launch_time_s
-                     and confirmed >= c.v51_launch_confirmed_fraction)
+            ready_now = (radar_ok and tracks_ready and t >= c.v51_min_launch_time_s
+                         and confirmed >= c.v51_launch_confirmed_fraction)
+            if not ready_now:
+                self.ready_since = None
+            elif self.ready_since is None:
+                self.ready_since = t
+            ready = ready_now and t - self.ready_since >= c.v51_launch_stable_s
             if ready or (radar_ok and t >= c.v51_max_launch_wait_s):
                 self.start_loc = loc.copy()
                 opts = self._choose_aim(loc, vel, target_loc, ts, c.v51_launch_speed_mps,
@@ -341,7 +379,17 @@ class FlybyGuidance:
                 dv = None
                 fold_done = False
                 t_conflict = float(step[0] * dt)
-                act = clear[0] < 0.0 and t >= self.avoid_until
+                # V5.2: a conflict must persist over consecutive checks unless imminent
+                self.conflict_streak = self.conflict_streak + 1 if clear[0] < 0.0 else 0
+                persistent = (self.conflict_streak >= c.v51_persist_checks
+                              or t_conflict <= c.v51_immediate_s)
+                # V5.2: stop a dodge as soon as coasting from here is clear
+                if (self.phase in ("AVOID", "LATCHED_AVOID") and (self.emergency or t >= self.avoid_until)):
+                    coast = path_on_grid(self.dyn, loc, vel, dt, steps)
+                    if self._clearances(coast[None], g, sub, dt)[0][0] >= 0.0:
+                        self._abort_avoid(t, loc, vel, ts)
+                        clear = np.array([0.0])
+                act = clear[0] < 0.0 and t >= self.avoid_until and persistent
                 far = t_conflict > c.v51_action_horizon_s
                 if act:
                     emergency = False
@@ -383,6 +431,11 @@ class FlybyGuidance:
                             emergency = False
                         elif cand is not None:
                             dv = cand
+                if dv is not None and emergency and t_conflict > c.v51_emergency_horizon_s:
+                    # V5.2: no clearing manoeuvre exists for a distant conflict ->
+                    # wait for better tracks instead of an expensive blind dodge
+                    dv = None
+                    self.counts["deferred_emergencies"] += 1
                 if dv is not None:
                     if self.phase == "BURN" and self.v_target is not None:
                         # interrupt the launch burn: deliver the dodge NOW (as predicted),
@@ -459,6 +512,17 @@ class FlybyGuidance:
 
         # execute
         accel = np.zeros(3)
+        if self.phase == "WAIT" and c.v51_wait_hold:
+            # V5.2: hold against gravity so the shuttle never settles onto the pad
+            # (live run bde2f2fb: pad contact at ~16 s, 45.6 J). Commands below
+            # ~dt*authority are delivered proportionally by JetSelectionActuator
+            # (on-time = LP solution < one tick): per-tick dv equals the command.
+            up = (target_loc - loc) / max(rng, 1e-9)
+            cmd = (c.v51_wait_hold_speed_mps * up - vel) * c.v51_wait_gain
+            n = float(np.linalg.norm(cmd))
+            if n > c.v51_wait_max_cmd:
+                cmd *= c.v51_wait_max_cmd / n
+            accel = cmd
         if self.phase in ("BURN", "TRIM", "AVOID", "LATCHED_AVOID") and self.v_target is not None:
             err = self.v_target - vel
             if np.linalg.norm(err) < c.v51_done_tol_mps:
@@ -476,6 +540,21 @@ class FlybyGuidance:
         self.last["compute_ms"] = 1000.0 * (clock() - t_start)
         self.max_ms = max(self.max_ms, self.last["compute_ms"])
         return accel, self.metrics(rng)
+
+    def _abort_avoid(self, t, loc, vel, ts):
+        c = self.c
+        self.counts["aborts"] += 1
+        self.emergency = False
+        if self.resume_burn_target is not None:
+            v_new, miss = solve_velocity(self.dyn, loc, self.resume_burn_target, self.aim,
+                                         fixed_speed=c.v51_launch_speed_mps)
+            ok = miss < 5.0 and self._path_clear(loc, vel, v_new, ts)
+            self.phase, self.v_target = "BURN", (v_new if ok else self.resume_burn_target)
+            self.resume_burn_target = None
+            self.next_solve = t + 2.0
+        else:
+            self.phase = "LATCHED" if self.phase == "LATCHED_AVOID" else "COAST"
+            self.v_target = None
 
     def _path_clear(self, loc, vel, v_new, ts, horizon_s=None):
         if not len(ts.positions):
@@ -508,4 +587,6 @@ class FlybyGuidance:
                 f"v51_trims={self.counts['trims']} v51_avoids={self.counts['avoids']} v51_reaims={self.counts.get('reaims', 0)} "
                 f"v51_emergencies={self.counts['emergencies']} v51_deferred={self.counts['deferred_trims']} "
                 f"v51_min_clear_m={self.last['min_clearance']:.1f} v51_ca_target_m={self.last['ca_target']:.1f} "
-                f"v51_launch_t={self.launch_t:.1f} v51_ms={self.last['compute_ms']:.1f} v51_ms_max={self.max_ms:.1f}")
+                f"v51_launch_t={self.launch_t:.1f} v52_implausible={self.implausible} "
+                f"v52_deferred_emerg={self.counts['deferred_emergencies']} v52_aborts={self.counts['aborts']} "
+                f"v51_ms={self.last['compute_ms']:.1f} v51_ms_max={self.max_ms:.1f}")

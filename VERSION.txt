@@ -1,10 +1,18 @@
-Phobos Escape Controller V5.1-dev (fly-by guidance: gravity-aware burn-coast-trim + predictive avoidance)
-Log tag: PHOBOS_NAV_V51
+Phobos Escape Controller V5.2-dev (fly-by guidance + live-run fixes: WAIT gravity hold,
+reachable launch gate, phantom-track-robust avoidance)
+Log tag: PHOBOS_NAV_V52
 
 Based on: V4.3 500-debris validation candidate (../V43-BASELINE, unmodified),
-V5 Phases 0-2b (ccfaf61) and Phase A tracker retuning (df39ee0).
-Deployed to STPro: commit ccfaf61 (V50) only. V5.1 is NOT deployed.
-V5.1 evidence: offline mission bench only (tests/missionbench, official STU4-Sim
-scripts executed verbatim). No STPro run of V5.1 exists.
-Rollback switch: config.guidance_mode = "legacy_mpc" restores the V5.0 planner path.
-FINAL_SUBMISSION.simconf: not available locally (not yet tested against it).
+V5 Phases 0-2b (ccfaf61), Phase A tracker retuning (df39ee0), V5.1 (7951406).
+Installed in STPro at the time of this commit: V5.1 (7951406), deployed by the user.
+V5.2 is NOT deployed.
+Live evidence: one V5.1 STPro run (bde2f2fb, 57 s, validation simconf, backend
+2026/11/11) FAILED: pad contact during an unpowered wait (45.6 J), launch delayed
+to the 30 s fallback, phantom-track emergency dodges. V5.2 fixes those causes.
+V5.2 evidence: offline mission bench only (tests/missionbench; official STU4-Sim
+scripts executed verbatim, live-like tracker fault model). No STPro run of V5.2.
+Official simulator: STU4-Sim 0d753a2 (2026-11-11). FINAL_SUBMISSION.simconf
+sha256 45761cb5...; debris positions identical to the validation simconf,
+SpawnDebris seed 8193.
+Rollback: rollback_v5.ps1 (V5.1 or V50 backups); config.guidance_mode =
+"legacy_mpc" restores the V5.0 planner path.

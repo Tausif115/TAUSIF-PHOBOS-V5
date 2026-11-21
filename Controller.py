@@ -356,7 +356,7 @@ def fail_closed_tick(safety_state, detail=""):
     SetCommand(np.zeros(3, dtype=float), np.zeros(3, dtype=float))
     if iteration % CONFIG.log_every_n == 0:
         print(
-            f"PHOBOS_NAV_V51 t={t_from_start:.2f} "
+            f"PHOBOS_NAV_V52 t={t_from_start:.2f} "
             f"safety={safety_state} detail={str(detail)!r} "
             "cmd_accel_mps2=0.000",
             flush=True
@@ -742,7 +742,7 @@ while True:
         )
 
         log_line = (
-            f"PHOBOS_NAV_V51 "
+            f"PHOBOS_NAV_V52 "
             f"t={t_from_start:.2f} "
             f"range_m={target_distance:.2f} "
             f"rel_speed_mps={relative_speed:.3f} "

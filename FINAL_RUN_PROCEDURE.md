@@ -16,7 +16,7 @@ STU4-Sim (actuator, radar, scoring, spawner, simconfs, thruster CSV).
 powershell -ExecutionPolicy Bypass -File .\verify_installed_v5.ps1     # what is installed now (V50)
 powershell -ExecutionPolicy Bypass -File .\deploy_v5.ps1 -WhatIf       # all checks, no changes
 powershell -ExecutionPolicy Bypass -File .\deploy_v5.ps1               # timestamped backup + install + SHA256 verify
-powershell -ExecutionPolicy Bypass -File .\verify_installed_v5.ps1     # must report tag PHOBOS_NAV_V51 and all modules MATCH
+powershell -ExecutionPolicy Bypass -File .\verify_installed_v5.ps1     # must report tag PHOBOS_NAV_V52 and all modules MATCH
 ```
 The deploy copies `Controller.py` and every `experimental\phobos_nav\*.py`
 (including the new `ballistic.py`) and keeps a verified backup under
@@ -30,19 +30,26 @@ powershell -ExecutionPolicy Bypass -File .\verify_installed_v5.ps1
 ```
 Rollback backs up the current install first. Fast in-place fallback without
 redeploying: in `experimental\phobos_nav\config.py` set
-`guidance_mode = "legacy_mpc"` (V5.0 planner path) — only if V5.1 misbehaves.
+`guidance_mode = "legacy_mpc"` (V5.0 planner path) — only if V5.2 misbehaves.
 
-## 3. Short smoke check (validation simconf, 30-60 s)
-Open `COMPETITION_SIM_500_RADAR_VALIDATION.simconf`, run 30-60 s, stop. In the
-on-screen/console log confirm: `PHOBOS_NAV_V51`, `radar_available=500`,
-`v51_phase` goes `WAIT -> BURN` at ~11 s, `safety=CLEAR`, `damage=0.000`,
-`fuel_kg` rising ~0.5 kg/s only while `v51_phase=BURN`.
+## 3. Validation run (validation simconf)
+Open `COMPETITION_SIM_500_RADAR_VALIDATION.simconf` (after the STU4-Sim update its
+debris equal FINAL_SUBMISSION's, seed 8193). In the on-screen/console log confirm:
+- `PHOBOS_NAV_V52`, `radar_available=500`, `damage=0.000` throughout.
+- WAIT (first ~20 s): `cmd_accel_mps2` ~0.000-0.002 (gravity hold), `range_m`
+  NOT increasing (an increasing range means the shuttle is sinking toward the pad),
+  `fuel_kg` rising only ~0.05 kg/s.
+- `v51_phase` `WAIT -> BURN` at ~13-21 s (live estimate ~20 s), then `range_m`
+  decreasing and `fuel_kg` rising ~0.5 kg/s during BURN, `safety=CLEAR`.
+- No `EMERGENCY_AVOID` at launch; `v52_implausible` may be non-zero (handled).
+Abort and roll back if damage rises or range increases during WAIT.
 
 ## 4. Final competition run (recorded)
 1. Start the screen recorder (full screen, include STPro window and clock), then
    open `FINAL_SUBMISSION.simconf` — verify the file name in the STPro title/sim list.
 2. Start the simulation; do not touch controls. Expected (offline prediction,
-   not a guarantee): launch ~11 s, burn ~70 s, coast, fly-by success ~240-250 s.
+   not a guarantee): gravity hold, launch ~20 s, burn ~70 s, coast, fly-by
+   success ~250-260 s.
 3. Keep recording until the Scoring alert "Successfully escaped Phobos with a
    score of ..." and its time/fuel/damage lines are visible, plus ~20 s.
 4. Stop the simulation, then the recording.
