@@ -1,3 +1,80 @@
+# V5.3-dev — track reliability, WAIT-phase safety (offline bench only; NOT deployed)
+
+## Why: live V5.2 run 2e9a2483 (STPro, validation simconf)
+- Escaped, score 14.4 (= 50 + 100(120/254.0 - 62.11/75)), fuel 62.11 kg.
+- Radar truth (RADAR_DIAGNOSTIC range-rate, sigma 0.02 m/s): debris move 1-5 m/s;
+  same-object range-rate stable over 4.7-20 s. V5.2's speed cap (1.5 + 0.015 t)
+  rejected 198-456 genuine tracks, reset them to zero velocity and guarded them
+  only 25 s -> folds of 2.8 m/s + a 0.8 m/s emergency against threats first
+  seen at the 25 s edge (safety defect + ~23 kg excess fuel).
+- Target-ship contact 71,042.6 J at 257.1 s, 3 s after the latch (not scored,
+  Scoring.py stops evaluating after success). Ship geometry is an Unreal asset
+  (E_AsteroidCycler, scale 10); not verifiable from readable files. No terminal
+  guidance change made.
+
+## Track reliability (ballistic.py `_reliable`, tracking.py, threats.py)
+- V5.2 speed cap removed. The tracker already fuses range-rate; a track is
+  unreliable only on evidence: radial residual vs its last radar radial velocity
+  > 1.0 m/s, speed clamp, or suspect update (normalised innovation > chi2(4) 99 %,
+  or > 1.5 m/s velocity jump between updates of a mature track).
+- Fallback: measured radial velocity, untrusted tangential dropped, re-extrapolated
+  from the last measurement. Margin growth = clip(filter velocity sigma, 0.07, 3.0) m/s.
+- Low-confidence tracks (sigma > 1 m/s, e.g. fresh/reacquired with the 5 m/s
+  tangential prior, or unreliable/suspect) guard only 12 s ahead; emergency
+  (non-clearing) dodges against them only when the conflict is <= 8 s away.
+- Tracker bookkeeping only (estimator unchanged): radial measurement, line of
+  sight, clamp flag, suspect flag, NIS, cached velocity sigma per track.
+
+## WAIT phase (ballistic.py `_wait_phase`)
+- Launch states GRAVITY_HOLD / RADAR_ACQUISITION / LAUNCH_READY / LAUNCH_COMMIT /
+  SAFE_HOLD / EMERGENCY_LIFTOFF; gravity hold never disabled while waiting.
+- Pad monitor (1 Hz, 60 s look-ahead; acts on conflicts <= 30 s, confident or
+  <= 8 s): emergency lift-off via a clearing launch direction, else a dodge from
+  the hold point with the full in-flight candidate set, then the burn resumes.
+- Launch gate: corridor clear for 40 s, else SAFE_HOLD (max 45 s; never while
+  the pad itself is threatened). Retained tracks guard the pad during outages.
+
+## Real-time
+- Lazy reliability view (computed only when a decision reads tracks, ~1 Hz);
+  velocity sigma cached at update. Event-triggered checks not adopted (radar
+  publishes every ~0.42 s, a new-data trigger would fire every check).
+
+## Diagnostics
+- TRACK_DIAGNOSTIC adds t_meas, rr_meas_mps, v_los_mps, rr_res_mps, vsig_mps,
+  clamped. Main log adds v53_unreliable/inconsistent/clamped/tentative/suspect/
+  lowconf, v53_res_p90, v53_vsig_p50/p90, v53_spd_p50/p90, v53_thr_cls,
+  v53_launch_state, v53_pad_clear_m/tc_s/cls/id, v53_liftoffs, v53_safe_holds,
+  v53_deferred_lowconf. Log tag PHOBOS_NAV_V53.
+
+## Bench (test-only)
+- Tracker faults reacquire like DebrisTracker (radial-only velocity, 5 m/s
+  tangential prior, hits = 1) at the live 2.0/s; version-independent.
+- Radar-outage injection (`radar_outages`); live-calibrated debris speeds
+  (`debris_extra_velocity={"sigma":2.5}`).
+
+## Offline results (bench predictions, not competition results; same seeds)
+| class | V5.3 score med / worst | V5.3 fuel med | V5.3 debris-coll runs | V5.2 score med | V5.2 coll runs |
+|---|---|---|---|---|---|
+| FINAL clean | 45.0 | 40.5 kg | 0/1 | 47.4 | 0/1 |
+| FINAL live velocities | 48.8 | 37.1 kg | 0/1 | 4.3 | 0/1 |
+| FINAL + faults | 44.5 / 42.5 | 40.9 kg | 0/3 | 2.7 | 0/3 |
+| FINAL + faults + phantoms | 37.6 / 37.6 | 45.7 kg | 0/3 | 2.7 | 0/3 |
+| FINAL harsh faults | 47.8 | 37.0 kg | 0/1 | 19.8 | 0/1 |
+| radar outages | 45.9 / 45.8 | 39.4 kg | 0/3 | 8.9 | 0/3 |
+| 20 seeds + faults | 44.2 / 20.8 | 42.2 kg | 2/20 | 10.7 | 5/20 |
+| threats + faults | 29.8 / 13.0 | 52.5 kg | 1/11 | 16.4 | 4/11 |
+| WAIT pad/corridor threats | 26.9 / 1.3 | 52.8 kg | 6/8 | 21.6 | 7/8 |
+| 20 seeds clean | 40.3 / 6.2 | 43.6 kg | 0/20 | - | - |
+- Remaining V5.3 collisions: start-up hazards in synthetic layouts (contact at
+  3.1 s / 6.6 s, no escape time at 0.1 m/s^2), two invalid WAIT tests (overlap
+  at t=0), three physically unescapable WAIT tests, one graze (WAIT test 6,
+  1.9 m/s at 29.9 s vs V5.2 3.05 m/s at 22.7 s). No in-flight debris collision.
+- Real timing: loop work p50 1.4 ms (V5.2 1.3), p95 5.4-5.6 ms, max 13.1 ms;
+  overruns 5-6 in ~267 s (V5.2 8).
+
+## Tests
+96 passed (6 new V5.3 tests; V5.2 speed-cap test replaced).
+
 # V5.2-dev — live-run fixes (offline bench only; NOT deployed, no STPro run)
 
 ## Why: live V5.1 run bde2f2fb (STPro, validation simconf, 57 s) FAILED

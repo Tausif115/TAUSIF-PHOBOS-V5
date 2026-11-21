@@ -90,6 +90,11 @@ class BenchEntity(st.Entity):
     GetParamArray = GetParam
 
     def SetParam(self, var_type, key, value):
+        outages = self.bench.o.get("radar_outages") or ()
+        if outages and list(key) == ["Radar", "SortedDebrisData"]:
+            now = self.bench.world.t
+            if any(a <= now < b for a, b in outages):
+                return                      # radar publication lost (outage injection)
         if isinstance(value, np.ndarray):
             value = value.copy()
         elif isinstance(value, list):
@@ -304,6 +309,7 @@ class Bench:
         radar_overhead=0.26, actuator_overhead=0.03, spawn_overhead=0.03,
         # sensitivity / stress options (defaults = nominal model)
         rotation_transpose=False,       # alternative attitude convention for the shuttle
+        radar_outages=(),                # test-only: [(t0, t1), ...] radar publications dropped
         debris_extra_velocity=None,     # None | {"sigma": m/s} | {"profile": "live"}
         debris_extra_seed=0,
     )

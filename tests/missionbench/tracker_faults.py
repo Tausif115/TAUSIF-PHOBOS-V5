@@ -1,15 +1,16 @@
 """Live-like tracker faults for the offline bench (test-only; wraps the real
 DebrisTracker.update after it runs, so the controller sees corrupted tracks).
 
-Rates calibrated on live runs 0555d4ef / bde2f2fb (500 debris):
-  reacquisitions ~6.5 /s  -> track restarted unconfirmed with a poor velocity
+Rates calibrated on live runs (500 debris): reacquisitions 2.0 /s in V5.2 run
+2e9a2483 (6.5 /s in V5.1 run bde2f2fb) -> track restarted like DebrisTracker
+does (radial-only velocity, 5 m/s tangential prior, hits = 1);
   velocity clamps ~0.33 /s -> mis-associated track with an implausible velocity
 Phantoms: at scheduled times the track nearest the shuttle (30-150 m) gets a
 confirmed velocity aimed at the shuttle (the bde2f2fb track-38 pattern).
 """
 import numpy as np
 
-DEFAULTS = dict(seed=0, start_s=4.0, reacq_rate=6.5, reacq_sigma=1.0,
+DEFAULTS = dict(seed=0, start_s=4.0, reacq_rate=2.0, reacq_sigma=1.0, reacq_mode="tracker",
                 bad_rate=0.35, bad_speed=(4.0, 15.0), phantoms=())
 
 
@@ -31,8 +32,24 @@ def install(tracking_module, spec):
         n = len(self.tracks)
         for i in rng.integers(0, n, rng.poisson(o["reacq_rate"] * dt)):
             tr = self.tracks[i]
-            tr.velocity = np.asarray(tr.velocity, float) + rng.normal(0.0, o["reacq_sigma"], 3)
-            tr.hits, tr.confirmed = 2, False      # one more hit re-confirms (live plateau ~94 %)
+            rel = np.asarray(tr.position, float) - np.asarray(shuttle_position, float)
+            los = rel / max(np.linalg.norm(rel), 1e-9)          # same for every controller version
+            if o["reacq_mode"] == "tracker":
+                # what DebrisTracker does on reacquisition: radial-only velocity
+                # (the radial part is radar-accurate), unknown tangential (prior
+                # sigma 5 m/s), hits restart at 1
+                vr = float(np.dot(tr.velocity, los))
+                tr.velocity = vr * los
+                if tr.covariance is not None:
+                    cov = np.array(tr.covariance, float)
+                    cov[3:, 3:] = 25.0 * (np.eye(3) - np.outer(los, los)) + 0.0025 * np.outer(los, los)
+                    cov[:3, 3:] = 0.0
+                    cov[3:, :3] = 0.0
+                    tr.covariance = cov
+                tr.hits, tr.confirmed = 1, False
+            else:   # legacy V5.2 fault: velocity noise, one hit short of confirmation
+                tr.velocity = np.asarray(tr.velocity, float) + rng.normal(0.0, o["reacq_sigma"], 3)
+                tr.hits, tr.confirmed = 2, False
             state["stats"]["reacq"] += 1
         for i in rng.integers(0, n, rng.poisson(o["bad_rate"] * dt)):
             d = rng.normal(size=3)

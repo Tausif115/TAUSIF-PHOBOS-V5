@@ -97,6 +97,7 @@ from phobos_nav.scheduling import DeadlinePlanner
 from phobos_nav.ballistic import FlybyGuidance
 from phobos_nav.threats import (
     track_state_arrays,
+    _velocity_sigma,
     nearest_track_distance as nearest_track_distance_from_state,
     threat_ttc_seconds as threat_ttc_seconds_from_state,
 )
@@ -356,7 +357,7 @@ def fail_closed_tick(safety_state, detail=""):
     SetCommand(np.zeros(3, dtype=float), np.zeros(3, dtype=float))
     if iteration % CONFIG.log_every_n == 0:
         print(
-            f"PHOBOS_NAV_V52 t={t_from_start:.2f} "
+            f"PHOBOS_NAV_V53 t={t_from_start:.2f} "
             f"safety={safety_state} detail={str(detail)!r} "
             "cmd_accel_mps2=0.000",
             flush=True
@@ -742,7 +743,7 @@ while True:
         )
 
         log_line = (
-            f"PHOBOS_NAV_V52 "
+            f"PHOBOS_NAV_V53 "
             f"t={t_from_start:.2f} "
             f"range_m={target_distance:.2f} "
             f"rel_speed_mps={relative_speed:.3f} "
@@ -865,6 +866,21 @@ while True:
                 )), 2),
                 "hits": track.hits,
                 "confirmed": track.confirmed,
+                # V5.3: radar radial velocity vs the track's estimate along
+                # the same line of sight (residual), velocity sigma, timing.
+                "t_meas": round(float(track.timestamp), 2),
+                "rr_meas_mps": round(float(track.radial_velocity_meas), 3),
+                "v_los_mps": (
+                    round(float(np.dot(track.velocity, track.los)), 3)
+                    if track.los is not None else None
+                ),
+                "rr_res_mps": (
+                    round(float(np.dot(track.velocity, track.los)
+                                - track.radial_velocity_meas), 3)
+                    if track.los is not None else None
+                ),
+                "vsig_mps": round(_velocity_sigma(track.covariance), 3),
+                "clamped": bool(track.clamped),
             }
             for track in sorted(
                 tracker.tracks,

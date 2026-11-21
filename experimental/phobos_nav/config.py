@@ -216,9 +216,26 @@ class Config:
     v51_wait_hold_speed_mps: float = 0.01     # small climb, away from the pad
     v51_wait_gain: float = 0.2                # fraction of velocity error per tick
     v51_wait_max_cmd: float = 0.0015          # stays in the proportional regime
-    # physical debris speed bound: SpawnDebris start <= 0.8 m/s + fall ~0.0105 t
-    v51_plausible_speed_mps: float = 1.5
-    v51_plausible_speed_rate: float = 0.015
+    # V5.3 track reliability (replaces the V5.2 speed cap, disproved live):
+    # range-rate residual tolerance (the tracker fuses range-rate, sigma
+    # 0.02 m/s), margin growth = max(base, k x filter velocity sigma), and the
+    # sigma used when a track has no covariance.
+    v53_rr_tolerance_mps: float = 1.0
+    v53_sigma_k: float = 1.0
+    v53_default_vel_sigma_mps: float = 1.0
+    v53_growth_cap_mps: float = 3.0           # cap on uncertainty-driven margin growth
+    v53_confident_sigma_mps: float = 1.0      # velocity sigma above this = low confidence
+    v53_lowconf_horizon_s: float = 12.0       # low-confidence tracks guard >= 2 radar revisits
+    v53_lowconf_emergency_s: float = 8.0      # emergency (non-clearing) dodge for low-conf only if this close
+    v53_nis_suspect: float = 13.28            # chi2(4 dof) 99 %: update innovation -> suspect track
+    v53_vjump_mps: float = 1.5                # velocity jump between updates of a mature track -> suspect
+    # WAIT phase (launch states, pad monitoring, launch gate)
+    v53_wait_check_period_s: float = 1.0
+    v53_wait_horizon_s: float = 60.0          # pad / emergency-lift-off look-ahead
+    v53_launch_gate_s: float = 40.0           # launch corridor must be clear this long
+    v53_safe_hold_max_s: float = 45.0         # SAFE_HOLD limit after first readiness
+    v53_liftoff_window_margin_s: float = 15.0 # lift-off judged over time-to-conflict + this
+    v53_pad_threat_s: float = 30.0            # pad conflicts act within this time-to-conflict
     v51_tentative_horizon_s: float = 25.0     # unreliable tracks guard only the near term
     v51_emergency_horizon_s: float = 20.0     # no blind (non-clearing) dodge for later conflicts
     v51_persist_checks: int = 2               # consecutive conflict checks before acting...

@@ -99,6 +99,22 @@ class DebrisTrack:
     # run 0555d4ef: ~77 % of such tracks failed their first loop update).
     # A provisional track is replaced by its first loop measurement.
     provisional: bool = False
+    # V5.3 diagnostics: absolute radial velocity measured by the radar at the
+    # last update (range-rate + shuttle velocity along the line of sight), the
+    # line-of-sight unit vector, and whether the speed was clamped then.
+    radial_velocity_meas: float = float("nan")
+    los: np.ndarray | None = None
+    clamped: bool = False
+    # V5.3: per-update consistency evidence (bookkeeping only; the estimator
+    # is unchanged). suspect = last update had a large normalised innovation
+    # (likely mis-association), or the velocity jumped between consecutive
+    # updates of a mature track (debris accelerate only ~0.01 m/s^2), or the
+    # speed was clamped. vel_sigma = RMS per-axis velocity sigma after the
+    # update (cached so it is not recomputed every controller tick).
+    suspect: bool = False
+    last_nis: float = float("nan")
+    vel_sigma: float = float("nan")
+    v_last_update: np.ndarray | None = None
 
     def position_at(self, timestamp):
         dt = float(timestamp) - self.timestamp
@@ -117,6 +133,29 @@ def _process_noise(dt, psd):
     q[3:, :3] = q[:3, 3:]
     q[3:, 3:] = psd * dt * _I3
     return q
+
+
+def velocity_sigma(covariance):
+    """RMS per-axis 1-sigma velocity uncertainty of a 6x6 covariance (nan if unknown)."""
+    if covariance is None:
+        return float("nan")
+    try:
+        return float(np.sqrt(max(np.trace(np.asarray(covariance)[3:, 3:]), 0.0) / 3.0))
+    except (TypeError, ValueError, IndexError):
+        return float("nan")
+
+
+def _record_radial(track, item):
+    """V5.3 diagnostics: store the radar's absolute radial velocity and the
+    line of sight of the measurement that last updated `track`."""
+    try:
+        rel = np.asarray(item["relative_position"], dtype=float)
+        los = rel / np.linalg.norm(rel)
+        track.los = los
+        track.radial_velocity_meas = float(item["range_rate"]) + float(
+            np.dot(np.asarray(item["shuttle_velocity"], dtype=float), los))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError, FloatingPointError):
+        track.los, track.radial_velocity_meas = None, float("nan")
 
 
 class DebrisTracker:
@@ -437,11 +476,22 @@ class DebrisTracker:
             item = valid[oi]
             dt = item["time"] - track.timestamp
             speed = norm(track.velocity)
-            if speed > max_speed:
+            track.clamped = speed > max_speed
+            if track.clamped:
                 track.velocity = limit_norm(track.velocity, max_speed)
                 clamped_count += 1
             track.diameter = item["diameter"]
             track.range_rate = item["range_rate"]
+            _record_radial(track, item)
+            nis = float(pair.get("d2", float("nan"))) if isinstance(pair, dict) else float("nan")
+            jump = (norm(track.velocity - track.v_last_update)
+                    if track.v_last_update is not None and track.hits >= cfg.confirmation_hits else 0.0)
+            track.last_nis = nis
+            track.suspect = bool(track.clamped
+                                 or (np.isfinite(nis) and nis > float(self._cfg("v53_nis_suspect", 13.28)))
+                                 or jump > float(self._cfg("v53_vjump_mps", 1.5)))
+            track.v_last_update = np.array(track.velocity, dtype=float)
+            track.vel_sigma = velocity_sigma(track.covariance)
             track.timestamp = item["time"]
             track.hits += 1
             track.confirmed = track.hits >= cfg.confirmation_hits
@@ -503,6 +553,11 @@ class DebrisTracker:
                 track.covariance = covariance
                 track.diameter = item["diameter"]
                 track.range_rate = item["range_rate"]
+                _record_radial(track, item)
+                track.clamped = False
+                track.suspect, track.last_nis = False, float("nan")
+                track.v_last_update = np.array(velocity, dtype=float)
+                track.vel_sigma = velocity_sigma(covariance)
                 track.timestamp = item["time"]
                 track.hits = 1
                 track.confirmed = False
@@ -538,6 +593,9 @@ class DebrisTracker:
                     provisional=item["provisional"],
                 )
             )
+            _record_radial(new_tracks[-1], item)
+            new_tracks[-1].v_last_update = np.array(velocity, dtype=float)
+            new_tracks[-1].vel_sigma = velocity_sigma(covariance)
             self.next_identifier += 1
             created_count += 1
 
@@ -767,8 +825,8 @@ class DebrisTracker:
         pair_cols = obs_index[assignable]
         pair_costs = (d2 + logdet)[assignable]
         pair_data = {
-            (int(r), int(c)): {"noise_rr": float(v)}
-            for r, c, v in zip(pair_rows, pair_cols, noise_rr[assignable])
+            (int(r), int(c)): {"noise_rr": float(v), "d2": float(q)}
+            for r, c, v, q in zip(pair_rows, pair_cols, noise_rr[assignable], d2[assignable])
         }
         if pair_rows.size == 0:
             return [], replay, coarse_candidates

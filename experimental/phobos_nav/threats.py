@@ -13,7 +13,7 @@ compares every function against frozen copies of the Phase 1 code.
 from dataclasses import dataclass
 import numpy as np
 
-from .tracking import DebrisTrack
+from .tracking import DebrisTrack, velocity_sigma
 
 _MISSING = object()
 
@@ -32,6 +32,14 @@ class TrackStateArrays:
     # V4.3 controller loops required track.position_at (tracks without it
     # were skipped); the planner extrapolated them. Kept for exact parity.
     has_position_at: np.ndarray = None  # (N,) bool
+    # V5.3 (None when unavailable): radar-measured absolute radial velocity and
+    # line of sight of each track's last update, 1-sigma velocity uncertainty
+    # from the filter covariance, and the tracker's speed-clamp flag.
+    radial_meas: np.ndarray = None      # (N,)
+    los: np.ndarray = None              # (N,3)
+    vel_sigma: np.ndarray = None        # (N,)
+    clamped: np.ndarray = None          # (N,) bool
+    suspect: np.ndarray = None          # (N,) bool (V5.3 per-update evidence)
 
     def __len__(self):
         return int(self.positions.shape[0])
@@ -76,9 +84,21 @@ def track_state_arrays(tracks, timestamp):
         return _general_track_state_arrays(tracks, timestamp)
 
     ages = np.maximum(0.0, timestamp - times)
+    nan3 = (float("nan"),) * 3
+    extra = dict(
+        radial_meas=np.asarray([track.radial_velocity_meas for track in tracks], dtype=float),
+        los=np.asarray([nan3 if track.los is None else track.los for track in tracks],
+                       dtype=float).reshape(-1, 3),
+        vel_sigma=np.asarray([track.vel_sigma for track in tracks], dtype=float),
+        clamped=np.asarray([bool(track.clamped) for track in tracks], dtype=bool),
+        suspect=np.asarray([bool(track.suspect) for track in tracks], dtype=bool),
+    )
     return _filtered(positions, velocities, ages, diameters, confirmed,
                      confirmed_or_hits, identifiers, timestamp,
-                     np.ones(len(tracks), dtype=bool))
+                     np.ones(len(tracks), dtype=bool), **extra)
+
+
+_velocity_sigma = velocity_sigma     # V5.3 diagnostics alias (Controller.py)
 
 
 def _general_track_state_arrays(tracks, timestamp):
@@ -123,7 +143,7 @@ def _general_track_state_arrays(tracks, timestamp):
 
 
 def _filtered(positions, velocities, ages, diameters, confirmed,
-              confirmed_or_hits, identifiers, timestamp, has_position_at):
+              confirmed_or_hits, identifiers, timestamp, has_position_at, **extra):
     usable = (
         np.all(np.isfinite(positions), axis=1)
         & np.all(np.isfinite(velocities), axis=1)
@@ -137,6 +157,7 @@ def _filtered(positions, velocities, ages, diameters, confirmed,
         confirmed=confirmed[usable], confirmed_or_hits=confirmed_or_hits[usable],
         identifiers=identifiers[usable], timestamp=float(timestamp),
         has_position_at=has_position_at[usable],
+        **{name: (None if value is None else value[usable]) for name, value in extra.items()},
     )
 
 

@@ -1,18 +1,18 @@
-Phobos Escape Controller V5.2-dev (fly-by guidance + live-run fixes: WAIT gravity hold,
-reachable launch gate, phantom-track-robust avoidance)
-Log tag: PHOBOS_NAV_V52
+Phobos Escape Controller V5.3-dev (fly-by guidance; radar-consistent track reliability,
+uncertainty-aware margins, WAIT-phase pad monitoring with SAFE_HOLD / emergency lift-off)
+Log tag: PHOBOS_NAV_V53
 
 Based on: V4.3 500-debris validation candidate (../V43-BASELINE, unmodified),
-V5 Phases 0-2b (ccfaf61), Phase A tracker retuning (df39ee0), V5.1 (7951406).
-Installed in STPro at the time of this commit: V5.1 (7951406), deployed by the user.
-V5.2 is NOT deployed.
-Live evidence: one V5.1 STPro run (bde2f2fb, 57 s, validation simconf, backend
-2026/11/11) FAILED: pad contact during an unpowered wait (45.6 J), launch delayed
-to the 30 s fallback, phantom-track emergency dodges. V5.2 fixes those causes.
-V5.2 evidence: offline mission bench only (tests/missionbench; official STU4-Sim
-scripts executed verbatim, live-like tracker fault model). No STPro run of V5.2.
-Official simulator: STU4-Sim 0d753a2 (2026-11-11). FINAL_SUBMISSION.simconf
-sha256 45761cb5...; debris positions identical to the validation simconf,
-SpawnDebris seed 8193.
-Rollback: rollback_v5.ps1 (V5.1 or V50 backups); config.guidance_mode =
+V5 Phases 0-2b (ccfaf61), Phase A (df39ee0), V5.1 (7951406), V5.2 (10a6177).
+Installed in STPro at the time of this commit: V5.2 (10a6177). V5.3 is NOT deployed.
+Live evidence: V5.2 STPro run 2e9a2483 (validation simconf, backend 2026/11/11):
+escaped, score 14.4, 62.11 kg, 254.0 s, damage 0 at latch; target-ship contact
+71,042.6 J 3 s after the latch (not scored). Radar truth showed debris moving
+1-5 m/s; V5.2's speed cap rejected most genuine tracks (fixed in V5.3).
+V5.3 evidence: offline mission bench only (live-calibrated debris speeds and
+tracker faults). No STPro run of V5.3.
+Open: target-ship collision geometry is unverified (Unreal asset); no terminal
+guidance change was made.
+Official simulator: STU4-Sim 0d753a2 (FINAL_SUBMISSION.simconf, seed 8193).
+Rollback: rollback_v5.ps1 (V5.2 / V5.1 / V50 backups); config.guidance_mode =
 "legacy_mpc" restores the V5.0 planner path.

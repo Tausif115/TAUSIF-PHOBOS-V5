@@ -115,6 +115,18 @@ def solve_velocity(dyn, p, v_guess, aim, fixed_speed=None, iterations=30, tol=0.
     return v, d
 
 
+class _LazyReliable:
+    """Defers FlybyGuidance._reliable until a decision reads the tracks."""
+
+    def __init__(self, guide, raw, t):
+        self._guide, self._raw, self._t, self._view = guide, raw, t, None
+
+    def __getattr__(self, name):
+        if self._view is None:
+            self._view = self._guide._reliable(self._raw, self._t)
+        return getattr(self._view, name)
+
+
 class FlybyGuidance:
     """State machine WAIT -> BURN -> COAST <-> {TRIM, AVOID} -> LATCHED."""
 
@@ -133,7 +145,8 @@ class FlybyGuidance:
         self.emergency = False
         self.counts = {"trims": 0, "avoids": 0, "emergencies": 0, "deferred_trims": 0, "reaims": 0}
         self.dv_planned = 0.0
-        self.last = {"min_clearance": float("inf"), "threat_id": -1, "threat_t": float("nan"),
+        self.diag = {}
+        self.last = {"min_clearance": float("inf"), "threat_id": -1, "threat_cls": -1, "threat_t": float("nan"),
                      "ca_target": float("nan"), "compute_ms": 0.0, "candidates": 0, "feasible": 0}
         self.launch_t = float("nan")
         self.max_ms = 0.0
@@ -143,31 +156,84 @@ class FlybyGuidance:
         self.committed_until = -1.0
         self.resume_burn_target = None
         self.ready_since = None
+        self.first_ready_t = None
+        self.launch_state = "GRAVITY_HOLD"
+        self.next_wait_check = 0.0
+        self.pad_streak = 0
+        self.gate_streak = 0
         self.conflict_streak = 0
         self.implausible = 0
         self.counts.update({"deferred_emergencies": 0, "aborts": 0})
 
     # ------------------------------------------------------- track reliability
     def _reliable(self, ts, t):
-        """V5.2: a track whose speed exceeds the physical bound (SpawnDebris
-        start speed + gravity fall, with margin) has a corrupted velocity
-        (live run bde2f2fb: mis-association / reacquisition). Its extrapolated
-        position is then garbage too, so it is reset to the last measured
-        position with zero velocity and treated as tentative (growing
-        uncertainty ball, short guard horizon)."""
+        """V5.3 track reliability (replaces the V5.2 absolute speed cap, which
+        live radar truth disproved: in run 2e9a2483 debris move 1-5 m/s and the
+        radar range-rate of the same object is stable over 4.7-20 s).
+
+        The tracker fuses the radar range-rate (sigma 0.02 m/s, independent of
+        position noise) into every update, so a track's radial velocity should
+        match its last radar radial velocity. A track is UNRELIABLE only on
+        evidence: that residual exceeds v53_rr_tolerance_mps (velocity corrupted
+        or mis-associated since the update) or the tracker clamped its speed.
+        Fallback (conservative, uncertainty-aware): keep the measured radial
+        velocity, drop the untrusted tangential part, re-extrapolate from the
+        last measured position and treat the track as tentative (tangential
+        uncertainty grows with v51_tentative_growth_mps). Every track's margin
+        growth is max(v51_margin_growth_mps, v53_sigma_k x filter velocity
+        sigma), so young or poorly observed tracks get wider margins."""
         c = self.c
         s = self._subset(ts, slice(None))
+        n = len(s.positions)
         v = np.array(ts.velocities, dtype=float).reshape(-1, 3)
         p = np.array(ts.positions, dtype=float).reshape(-1, 3)
         ages = np.asarray(ts.ages, dtype=float).reshape(-1)
-        cap = c.v51_plausible_speed_mps + c.v51_plausible_speed_rate * max(float(t), 0.0)
-        bad = np.linalg.norm(v, axis=1) > cap
-        self.implausible = int(bad.sum())
+        nan = np.full(n, np.nan)
+        radial = getattr(ts, "radial_meas", None)
+        radial = nan if radial is None else np.asarray(radial, dtype=float).reshape(-1)
+        los = getattr(ts, "los", None)
+        los = np.full((n, 3), np.nan) if los is None else np.asarray(los, dtype=float).reshape(-1, 3)
+        sigma = getattr(ts, "vel_sigma", None)
+        sigma = nan if sigma is None else np.asarray(sigma, dtype=float).reshape(-1)
+        clamped = getattr(ts, "clamped", None)
+        clamped = np.zeros(n, dtype=bool) if clamped is None else np.asarray(clamped, dtype=bool).reshape(-1)
+        known = np.isfinite(radial) & np.all(np.isfinite(los), axis=1)
+        los0 = np.nan_to_num(los)
+        rad0 = np.nan_to_num(radial)
+        residual = np.where(known, np.einsum("ij,ij->i", v, los0) - rad0, np.nan)
+        inconsistent = known & (np.abs(np.nan_to_num(residual)) > c.v53_rr_tolerance_mps)
+        bad = inconsistent | clamped
         if bad.any():
-            p[bad] = p[bad] - v[bad] * ages[bad, None]
-            v[bad] = 0.0
+            v_new = np.where(known[:, None], rad0[:, None] * los0, 0.0)
+            p[bad] = p[bad] - (v[bad] - v_new[bad]) * ages[bad, None]
+            v[bad] = v_new[bad]
         s.positions, s.velocities = p, v
         s.confirmed = np.asarray(ts.confirmed, dtype=bool).reshape(-1) & ~bad
+        known_sigma = np.isfinite(sigma)
+        sig = np.where(known_sigma, sigma, c.v53_default_vel_sigma_mps)
+        s.growth = np.minimum(np.maximum(c.v51_margin_growth_mps, c.v53_sigma_k * sig), c.v53_growth_cap_mps)
+        # low confidence: velocity not yet pinned by repeated radar updates
+        # (fresh/reacquired tracks carry a 5 m/s tangential prior), or the
+        # evidence above says the estimate is corrupted
+        suspect = getattr(ts, "suspect", None)
+        suspect = np.zeros(n, dtype=bool) if suspect is None else np.asarray(suspect, dtype=bool).reshape(-1)
+        s.lowconf = bad | suspect | (known_sigma & (sigma > c.v53_confident_sigma_mps))
+        s.sigma_known = known_sigma
+        s.cls = np.where(s.lowconf, 2, np.where(s.confirmed, 0, 1))   # 0 reliable, 1 tentative, 2 low-confidence
+        self.implausible = int(bad.sum())
+        speeds = np.linalg.norm(v, axis=1)
+        fin_res = np.abs(residual[np.isfinite(residual)])
+        fin_sig = sigma[np.isfinite(sigma)]
+        self.diag = {
+            "inconsistent": int(inconsistent.sum()), "clamped": int(clamped.sum()),
+            "suspect": int(suspect.sum()), "lowconf": int(s.lowconf.sum()),
+            "tentative": int((s.cls == 1).sum()),
+            "res_p90": float(np.percentile(fin_res, 90)) if fin_res.size else float("nan"),
+            "sig_p50": float(np.median(fin_sig)) if fin_sig.size else float("nan"),
+            "sig_p90": float(np.percentile(fin_sig, 90)) if fin_sig.size else float("nan"),
+            "spd_p50": float(np.median(speeds)) if n else float("nan"),
+            "spd_p90": float(np.percentile(speeds, 90)) if n else float("nan"),
+        }
         return s
 
     # ---------------------------------------------------------------- predict
@@ -186,7 +252,12 @@ class FlybyGuidance:
         c = self.c
         ages = np.asarray(ts.ages, dtype=float)
         tentative = ~np.asarray(ts.confirmed, dtype=bool)
-        growth = c.v51_margin_growth_mps + np.where(tentative, c.v51_tentative_growth_mps, 0.0)
+        base = getattr(ts, "growth", None)          # V5.3: per-track, uncertainty-aware
+        base = c.v51_margin_growth_mps if base is None else np.asarray(base, dtype=float)
+        # the fixed tentative allowance only stands in for an unknown covariance
+        known = getattr(ts, "sigma_known", None)
+        extra_t = tentative if known is None else (tentative & ~np.asarray(known, dtype=bool))
+        growth = base + np.where(extra_t, c.v51_tentative_growth_mps, 0.0)
         return (c.v51_base_margin_m
                 + growth[None, :] * (times[:, None] + 0.5 * ages[None, :]))
 
@@ -202,6 +273,13 @@ class FlybyGuidance:
         if tentative.any():   # V5.2: unreliable tracks only guard the near term
             beyond = times > self.c.v51_tentative_horizon_s
             clear = np.where((beyond[:, None] & tentative[None, :])[None], np.inf, clear)
+        lowconf = getattr(ts, "lowconf", None)
+        if lowconf is not None and np.any(lowconf):
+            # V5.3: low-confidence tracks guard only until their next radar
+            # updates (imminent conflicts are still answered immediately)
+            beyond = times > self.c.v53_lowconf_horizon_s
+            lc = np.asarray(lowconf, dtype=bool)
+            clear = np.where((beyond[:, None] & lc[None, :])[None], np.inf, clear)
         flat = clear.reshape(clear.shape[0], -1)
         idx = np.argmin(flat, axis=1)
         return flat[np.arange(len(idx)), idx], idx // clear.shape[2], idx % clear.shape[2]
@@ -218,8 +296,10 @@ class FlybyGuidance:
         class _S:
             pass
         s = _S()
-        for name in ("positions", "velocities", "ages", "diameters", "confirmed", "identifiers"):
-            setattr(s, name, np.asarray(getattr(ts, name))[keep])
+        for name in ("positions", "velocities", "ages", "diameters", "confirmed", "identifiers",
+                     "growth", "cls", "lowconf", "sigma_known"):
+            if getattr(ts, name, None) is not None:
+                setattr(s, name, np.asarray(getattr(ts, name))[keep])
         return s
 
     def _nominal_path(self, loc, vel, dt, steps):
@@ -327,26 +407,12 @@ class FlybyGuidance:
         if self.phase != "LATCHED" and rng <= c.capture_radius_m:
             self.phase, self.v_target = "LATCHED", None
 
-        confirmed = float(np.mean(ts.confirmed)) if len(ts.positions) else 0.0
-        ts = self._reliable(ts, t)
+        n_tracks = len(ts.positions)
+        confirmed = float(np.mean(ts.confirmed)) if n_tracks else 0.0
+        ts = _LazyReliable(self, ts, t)
 
         if self.phase == "WAIT":
-            ready_now = (radar_ok and tracks_ready and t >= c.v51_min_launch_time_s
-                         and confirmed >= c.v51_launch_confirmed_fraction)
-            if not ready_now:
-                self.ready_since = None
-            elif self.ready_since is None:
-                self.ready_since = t
-            ready = ready_now and t - self.ready_since >= c.v51_launch_stable_s
-            if ready or (radar_ok and t >= c.v51_max_launch_wait_s):
-                self.start_loc = loc.copy()
-                opts = self._choose_aim(loc, vel, target_loc, ts, c.v51_launch_speed_mps,
-                                        c.v51_launch_horizon_s, 2.0)
-                best = max(opts, key=lambda o: (min(o["clear"], c.v51_aim_clearance_cap_m), -o["k"]))
-                self.aim, self.v_target = best["aim"], best["v"]
-                self.phase, self.launch_t = "BURN", t
-                self.next_solve = t + 2.0
-                self.last["min_clearance"] = best["clear"]
+            self._wait_phase(t, loc, vel, target_loc, ts, radar_ok, tracks_ready, confirmed, n_tracks)
 
         if self.phase == "TRIM" and t >= self.next_solve and self.aim is not None:
             v_new, miss = solve_velocity(self.dyn, loc, self.v_target, self.aim)
@@ -375,6 +441,8 @@ class FlybyGuidance:
                 clear, step, trk = self._clearances(base[None], g, sub, dt)
                 self.last["min_clearance"] = float(clear[0])
                 self.last["threat_id"] = int(sub.identifiers[trk[0]])
+                cls = getattr(sub, "cls", None)
+                self.last["threat_cls"] = int(cls[trk[0]]) if cls is not None else -1
                 self.last["threat_t"] = float(step[0] * dt)
                 dv = None
                 fold_done = False
@@ -431,6 +499,12 @@ class FlybyGuidance:
                             emergency = False
                         elif cand is not None:
                             dv = cand
+                lowconf_threat = bool(getattr(sub, "lowconf", np.zeros(len(sub.positions), bool))[trk[0]])
+                if dv is not None and emergency and lowconf_threat and t_conflict > c.v53_lowconf_emergency_s:
+                    # V5.3: a low-confidence track is re-measured within ~one radar
+                    # revisit; no blind emergency dodge for it unless imminent
+                    dv = None
+                    self.counts["deferred_lowconf"] = self.counts.get("deferred_lowconf", 0) + 1
                 if dv is not None and emergency and t_conflict > c.v51_emergency_horizon_s:
                     # V5.2: no clearing manoeuvre exists for a distant conflict ->
                     # wait for better tracks instead of an expensive blind dodge
@@ -541,6 +615,132 @@ class FlybyGuidance:
         self.max_ms = max(self.max_ms, self.last["compute_ms"])
         return accel, self.metrics(rng)
 
+    # ------------------------------------------------------------ WAIT phase
+    def _hold_path(self, loc, target_loc, dt, steps):
+        """Predicted shuttle path while gravity-holding (hold velocity, gravity cancelled)."""
+        up = (target_loc - loc) / max(np.linalg.norm(target_loc - loc), 1e-9)
+        times = np.arange(steps + 1) * dt
+        return loc[None, :] + (self.c.v51_wait_hold_speed_mps * up)[None, :] * times[:, None]
+
+    def _launch(self, t, loc, opt, state):
+        self.start_loc = self.start_loc if self.start_loc is not None else loc.copy()
+        self.aim, self.v_target = opt["aim"], opt["v"]
+        self.phase, self.launch_t = "BURN", t
+        self.launch_state = state
+        self.next_solve = t + 2.0
+        self.last["min_clearance"] = opt["clear"]
+
+    def _wait_phase(self, t, loc, vel, target_loc, ts, radar_ok, tracks_ready, confirmed, n_tracks):
+        """V5.3 launch states: GRAVITY_HOLD (no radar) -> RADAR_ACQUISITION ->
+        LAUNCH_READY -> LAUNCH_COMMIT, with SAFE_HOLD (launch corridor blocked
+        by a persistent conflict while the pad is safe) and EMERGENCY_LIFTOFF
+        (the hold point itself is threatened and a launch option clears more).
+        Gravity hold is never disabled while waiting. Retained tracks (within
+        expiry) keep guarding the pad during radar outages; a normal launch
+        needs live radar."""
+        c = self.c
+        if self.start_loc is None:
+            self.start_loc = loc.copy()
+        ready_now = (radar_ok and tracks_ready and t >= c.v51_min_launch_time_s
+                     and confirmed >= c.v51_launch_confirmed_fraction)
+        if not ready_now:
+            self.ready_since = None
+        elif self.ready_since is None:
+            self.ready_since = t
+        ready = ready_now and t - self.ready_since >= c.v51_launch_stable_s
+        fallback = radar_ok and t >= c.v51_max_launch_wait_s
+        if self.launch_state not in ("SAFE_HOLD",):
+            self.launch_state = ("GRAVITY_HOLD" if not radar_ok else
+                                 "LAUNCH_READY" if ready else "RADAR_ACQUISITION")
+
+        # pad monitoring (1 Hz)
+        if n_tracks and t >= self.next_wait_check:
+            self.next_wait_check = t + c.v53_wait_check_period_s
+            dt, steps = 1.0, int(c.v53_wait_horizon_s)
+            grid = self._debris_grid(ts, dt, steps)
+            clear, step, trk = self._clearances(self._hold_path(loc, target_loc, dt, steps)[None], grid, ts, dt)
+            pad_clear, pad_tc = float(clear[0]), float(step[0] * dt)
+            lowconf = bool(np.asarray(ts.lowconf)[trk[0]])
+            self.last["pad_clear"], self.last["pad_tc"] = pad_clear, pad_tc
+            self.last["pad_cls"] = int(np.asarray(ts.cls)[trk[0]])
+            self.last["pad_id"] = int(np.asarray(ts.identifiers)[trk[0]])
+            # act only on conflicts near enough to matter (full thrust moves
+            # ~0.05 t^2 m: 45 m in 30 s); later ones are re-checked at 1 Hz
+            threat = (pad_clear < 0.0 and pad_tc <= c.v53_pad_threat_s
+                      and (not lowconf or pad_tc <= c.v53_lowconf_emergency_s))
+            self.pad_streak = self.pad_streak + 1 if threat else 0
+            if threat and (self.pad_streak >= c.v51_persist_checks or pad_tc <= c.v51_immediate_s):
+                # emergency lift-off: staying is a predicted collision. Launch
+                # options (finite-burn, real authority) are judged over the
+                # imminent window only; later conflicts are handled in flight,
+                # where the full dodge candidate set (incl. lateral escapes) is
+                # available. Stay only if every option is strictly worse.
+                window = min(c.v53_wait_horizon_s, pad_tc + c.v53_liftoff_window_margin_s)
+                opts = self._choose_aim(loc, vel, target_loc, ts, c.v51_launch_speed_mps, window, dt)
+                pad_window = float(self._clearances(
+                    self._hold_path(loc, target_loc, dt, int(window))[None],
+                    self._debris_grid(ts, dt, int(window)), ts, dt)[0][0])
+                best = max(opts, key=lambda o: o["clear"]) if opts else None
+                if best is not None and best["clear"] >= max(pad_window, 0.0):
+                    self.counts["liftoffs"] = self.counts.get("liftoffs", 0) + 1
+                    self._launch(t, loc, best, "EMERGENCY_LIFTOFF")
+                    return
+                if best is not None:
+                    # no launch direction escapes: dodge from the hold point with
+                    # the full in-flight candidate set (lateral / along / against
+                    # the line of sight, finite-burn delay model), then resume the
+                    # launch burn toward the best aim
+                    steps_w = int(window)
+                    base = self._hold_path(loc, target_loc, dt, steps_w)
+                    grid_w = self._debris_grid(ts, dt, steps_w)
+                    self.aim = best["aim"]
+                    dv, emergency, _ = self._plan_avoidance(loc, vel, base, grid_w, ts, dt, pad_tc, 300.0)
+                    self.counts["liftoffs"] = self.counts.get("liftoffs", 0) + 1
+                    self.counts["avoids"] += 1
+                    self.counts["emergencies"] += int(emergency)
+                    self.dv_planned += float(np.linalg.norm(dv))
+                    self.v_target, self.resume_burn_target = vel + dv, best["v"]
+                    self.phase, self.launch_t, self.launch_state = "AVOID", t, "EMERGENCY_LIFTOFF"
+                    self.emergency = emergency
+                    self.committed_until = self.avoid_until = t + c.v51_avoid_commit_s
+                    self.next_solve = t + 2.0
+                    self.next_trim = t + c.v51_avoid_commit_s
+                    return
+                self.counts["liftoff_futile"] = self.counts.get("liftoff_futile", 0) + 1
+
+        if not (ready or fallback):
+            return
+        # launch gate: the corridor must be clear over the first v53_launch_gate_s
+        opts = self._choose_aim(loc, vel, target_loc, ts, c.v51_launch_speed_mps,
+                                c.v51_launch_horizon_s, 2.0)
+        if not opts:
+            return
+        gate_steps = int(c.v53_launch_gate_s)
+        for o in opts:
+            if n_tracks:
+                path = path_on_grid(self.dyn, loc, vel, 1.0, gate_steps, o["v"], c.v51_thrust_accel_mps2)
+                grid = self._debris_grid(ts, 1.0, gate_steps)
+                o["near"] = float(self._clearances(path[None], grid, ts, 1.0)[0][0])
+            else:
+                o["near"] = float("inf")
+        clear_near = [o for o in opts if o["near"] >= 0.0]
+        if not clear_near and t - self.ready_t0(t) < c.v53_safe_hold_max_s:
+            self.gate_streak += 1
+            if self.gate_streak >= c.v51_persist_checks:
+                if self.launch_state != "SAFE_HOLD":
+                    self.counts["safe_holds"] = self.counts.get("safe_holds", 0) + 1
+                self.launch_state = "SAFE_HOLD"
+            return
+        self.gate_streak = 0
+        pool = clear_near or opts
+        best = max(pool, key=lambda o: (min(o["clear"], c.v51_aim_clearance_cap_m), o["near"], -o["k"]))
+        self._launch(t, loc, best, "LAUNCH_COMMIT")
+
+    def ready_t0(self, t):
+        if self.first_ready_t is None:
+            self.first_ready_t = t
+        return self.first_ready_t
+
     def _abort_avoid(self, t, loc, vel, ts):
         c = self.c
         self.counts["aborts"] += 1
@@ -572,6 +772,8 @@ class FlybyGuidance:
                  "AVOID": "AVOIDING", "LATCHED": "CAPTURED", "LATCHED_AVOID": "AVOIDING"}[self.phase]
         if self.emergency and self.phase in ("AVOID", "LATCHED_AVOID"):
             state = "EMERGENCY_AVOID"
+        if self.phase == "WAIT" and self.launch_state == "SAFE_HOLD":
+            state = "SAFE_HOLD"
         return {
             "risk": 0.0, "distance": rng, "clearance": self.last["min_clearance"],
             "emergency": bool(self.emergency and self.phase in ("AVOID", "LATCHED_AVOID")),
@@ -583,10 +785,22 @@ class FlybyGuidance:
         }
 
     def log_fields(self):
+        d, nan = self.diag, float("nan")
         return (f"v51_phase={self.phase} v51_dv_planned={self.dv_planned:.3f} "
                 f"v51_trims={self.counts['trims']} v51_avoids={self.counts['avoids']} v51_reaims={self.counts.get('reaims', 0)} "
                 f"v51_emergencies={self.counts['emergencies']} v51_deferred={self.counts['deferred_trims']} "
                 f"v51_min_clear_m={self.last['min_clearance']:.1f} v51_ca_target_m={self.last['ca_target']:.1f} "
-                f"v51_launch_t={self.launch_t:.1f} v52_implausible={self.implausible} "
+                f"v51_launch_t={self.launch_t:.1f} v53_unreliable={self.implausible} "
+                f"v53_inconsistent={d.get('inconsistent', 0)} v53_clamped={d.get('clamped', 0)} "
+                f"v53_tentative={d.get('tentative', 0)} v53_res_p90={d.get('res_p90', nan):.2f} "
+                f"v53_vsig_p50={d.get('sig_p50', nan):.2f} v53_vsig_p90={d.get('sig_p90', nan):.2f} "
+                f"v53_spd_p50={d.get('spd_p50', nan):.2f} v53_spd_p90={d.get('spd_p90', nan):.2f} "
+                f"v53_thr_cls={self.last.get('threat_cls', -1)} v53_suspect={d.get('suspect', 0)} "
+                f"v53_lowconf={d.get('lowconf', 0)} v53_launch_state={self.launch_state} "
+                f"v53_pad_clear_m={self.last.get('pad_clear', float('inf')):.1f} "
+                f"v53_pad_tc_s={self.last.get('pad_tc', float('nan')):.0f} v53_pad_cls={self.last.get('pad_cls', -1)} "
+                f"v53_pad_id={self.last.get('pad_id', -1)} "
+                f"v53_liftoffs={self.counts.get('liftoffs', 0)} v53_safe_holds={self.counts.get('safe_holds', 0)} "
+                f"v53_deferred_lowconf={self.counts.get('deferred_lowconf', 0)} "
                 f"v52_deferred_emerg={self.counts['deferred_emergencies']} v52_aborts={self.counts['aborts']} "
                 f"v51_ms={self.last['compute_ms']:.1f} v51_ms_max={self.max_ms:.1f}")
