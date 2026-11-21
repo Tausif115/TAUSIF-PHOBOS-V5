@@ -236,6 +236,10 @@ class Config:
     v53_safe_hold_max_s: float = 45.0         # SAFE_HOLD limit after first readiness
     v53_liftoff_window_margin_s: float = 15.0 # lift-off judged over time-to-conflict + this
     v53_pad_threat_s: float = 30.0            # pad conflicts act within this time-to-conflict
+    # WAIT escape may only climb: candidate elevations above the local horizon
+    # (local outward = radial from Phobos' centre) and the minimum accepted
+    v53_escape_elevations_deg: tuple = (20.0, 45.0, 70.0)
+    v53_escape_min_elevation_deg: float = 15.0
     v51_tentative_horizon_s: float = 25.0     # unreliable tracks guard only the near term
     v51_emergency_horizon_s: float = 20.0     # no blind (non-clearing) dodge for later conflicts
     v51_persist_checks: int = 2               # consecutive conflict checks before acting...

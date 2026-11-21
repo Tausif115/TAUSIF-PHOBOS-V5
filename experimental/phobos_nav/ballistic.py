@@ -307,20 +307,22 @@ class FlybyGuidance:
             return path_on_grid(self.dyn, loc, vel, dt, steps, self.v_target, self.c.v51_thrust_accel_mps2)
         return path_on_grid(self.dyn, loc, vel, dt, steps)
 
-    def _plan_avoidance(self, loc, vel, base_path, grid, ts, dt, t_conflict=30.0, t_remaining=200.0):
+    def _plan_avoidance(self, loc, vel, base_path, grid, ts, dt, t_conflict=30.0, t_remaining=200.0,
+                        dirs=None, weights=None):
         c = self.c
-        t_rem = max(t_remaining, t_conflict + 10.0)
-        lateral_cost = max(c.v51_lateral_cost, 1.0 + t_rem / (t_rem - t_conflict))
-        speed = np.linalg.norm(vel)
-        u = vel / speed if speed > 0.2 else (self.aim - loc) / np.linalg.norm(self.aim - loc)
-        e1 = np.cross(u, [0.0, 0.0, 1.0]); e1 /= np.linalg.norm(e1)
-        e2 = np.cross(u, e1)
-        dirs, weights = [], []
-        for a in range(8):
-            ang = a * math.pi / 4.0
-            dirs.append(math.cos(ang) * e1 + math.sin(ang) * e2); weights.append(lateral_cost)
-        dirs.append(u); weights.append(c.v51_speedup_cost)
-        dirs.append(-u); weights.append(c.v51_slowdown_cost)
+        if dirs is None:
+            t_rem = max(t_remaining, t_conflict + 10.0)
+            lateral_cost = max(c.v51_lateral_cost, 1.0 + t_rem / (t_rem - t_conflict))
+            speed = np.linalg.norm(vel)
+            u = vel / speed if speed > 0.2 else (self.aim - loc) / np.linalg.norm(self.aim - loc)
+            e1 = np.cross(u, [0.0, 0.0, 1.0]); e1 /= np.linalg.norm(e1)
+            e2 = np.cross(u, e1)
+            dirs, weights = [], []
+            for a in range(8):
+                ang = a * math.pi / 4.0
+                dirs.append(math.cos(ang) * e1 + math.sin(ang) * e2); weights.append(lateral_cost)
+            dirs.append(u); weights.append(c.v51_speedup_cost)
+            dirs.append(-u); weights.append(c.v51_slowdown_cost)
         mags = np.asarray(c.v51_avoid_magnitudes, dtype=float)
         cand = np.array([d * m for d in dirs for m in mags])          # (K, 3)
         cost = np.array([w * m for w in weights for m in mags])
@@ -622,6 +624,54 @@ class FlybyGuidance:
         times = np.arange(steps + 1) * dt
         return loc[None, :] + (self.c.v51_wait_hold_speed_mps * up)[None, :] * times[:, None]
 
+    def _climb_escape(self, loc, vel, target_loc, ts, dt, window, pad_tc):
+        """Best climbing escape from the hold point: (dv, emergency, clearance)
+        over the imminent window, or None. Candidates only climb (>= the
+        configured elevation above the local horizon); a result that is not
+        climbing is rejected outright (never toward the surface)."""
+        c = self.c
+        steps_w = int(window)
+        base = self._hold_path(loc, target_loc, dt, steps_w)
+        grid_w = self._debris_grid(ts, dt, steps_w)
+        up = self._local_up(loc)
+        dirs = self._climb_dirs(up)
+        saved_aim = self.aim
+        if self.aim is None:
+            self.aim = target_loc
+        dv, emergency, _ = self._plan_avoidance(loc, vel, base, grid_w, ts, dt, pad_tc, 300.0,
+                                                dirs=dirs, weights=[1.0] * len(dirs))
+        self.aim = saved_aim
+        mag = float(np.linalg.norm(dv))
+        if mag <= 0.0 or float(np.dot(dv, up)) < math.sin(math.radians(c.v53_escape_min_elevation_deg)) * mag - 1e-9:
+            return None
+        times = np.arange(steps_w + 1) * dt
+        lever = np.maximum(0.0, times - mag / (2.0 * c.v51_thrust_accel_mps2))
+        path = base + dv[None, :] * lever[:, None]
+        clear = float(self._clearances(path[None], grid_w, ts, dt)[0][0])
+        return dv, emergency, clear
+
+    @staticmethod
+    def _local_up(loc):
+        """Local outward normal: radial from Phobos' centre (the Phobos-frame
+        origin; guidance gravity is -mu r/|r|^3), NOT world +z."""
+        return np.asarray(loc, dtype=float) / max(float(np.linalg.norm(loc)), 1e-9)
+
+    def _climb_dirs(self, up):
+        """WAIT-escape candidates: straight out plus 8 azimuths at each of
+        v53_escape_elevations_deg above the local horizon (all climbing)."""
+        h1 = np.cross(up, [0.0, 0.0, 1.0])
+        if np.linalg.norm(h1) < 1e-6:
+            h1 = np.cross(up, [1.0, 0.0, 0.0])
+        h1 /= np.linalg.norm(h1)
+        h2 = np.cross(up, h1)
+        dirs = [up.copy()]
+        for elev in self.c.v53_escape_elevations_deg:
+            ce, se = math.cos(math.radians(elev)), math.sin(math.radians(elev))
+            for a in range(8):
+                az = a * math.pi / 4.0
+                dirs.append(se * up + ce * (math.cos(az) * h1 + math.sin(az) * h2))
+        return dirs
+
     def _launch(self, t, loc, opt, state):
         self.start_loc = self.start_loc if self.start_loc is not None else loc.copy()
         self.aim, self.v_target = opt["aim"], opt["v"]
@@ -685,16 +735,26 @@ class FlybyGuidance:
                     self.counts["liftoffs"] = self.counts.get("liftoffs", 0) + 1
                     self._launch(t, loc, best, "EMERGENCY_LIFTOFF")
                     return
-                if best is not None:
-                    # no launch direction escapes: dodge from the hold point with
-                    # the full in-flight candidate set (lateral / along / against
-                    # the line of sight, finite-burn delay model), then resume the
-                    # launch burn toward the best aim
-                    steps_w = int(window)
-                    base = self._hold_path(loc, target_loc, dt, steps_w)
-                    grid_w = self._debris_grid(ts, dt, steps_w)
+                esc = self._climb_escape(loc, vel, target_loc, ts, dt, window, pad_tc) if best is not None else None
+                # take the option with the best predicted clearance in the imminent
+                # window: hold, best launch direction or best climbing escape;
+                # never move into a worse prediction than staying (tie -> stay)
+                choice = "hold"
+                top = pad_window
+                if best is not None and best["clear"] > top:
+                    choice, top = "launch", best["clear"]
+                if esc is not None and esc[2] > top:
+                    choice, top = "escape", esc[2]
+                if choice == "launch":
+                    self.counts["liftoffs"] = self.counts.get("liftoffs", 0) + 1
+                    self._launch(t, loc, best, "EMERGENCY_LIFTOFF")
+                    return
+                if choice == "escape":
+                    # climbing dodge from the hold point (finite-burn delay model,
+                    # never below the local horizon), then resume the launch burn
+                    # toward the best aim
+                    dv, emergency, _ = esc
                     self.aim = best["aim"]
-                    dv, emergency, _ = self._plan_avoidance(loc, vel, base, grid_w, ts, dt, pad_tc, 300.0)
                     self.counts["liftoffs"] = self.counts.get("liftoffs", 0) + 1
                     self.counts["avoids"] += 1
                     self.counts["emergencies"] += int(emergency)

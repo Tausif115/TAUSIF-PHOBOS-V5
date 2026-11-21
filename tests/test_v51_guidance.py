@@ -1,6 +1,7 @@
 """V5.1 fly-by guidance unit tests (phobos_nav/ballistic.py). Offline only."""
 from dataclasses import replace
 from pathlib import Path
+import math
 import sys
 
 import numpy as np
@@ -233,3 +234,33 @@ def test_suspect_track_is_low_confidence():
     ts.suspect = np.array([True])
     r = guide._reliable(ts, 40.0)
     assert r.lowconf[0] and r.cls[0] == 2
+
+
+def test_wait_escape_never_points_toward_the_surface():
+    # FINAL_SUBMISSION run 6080cc23: the WAIT escape chose "slow down" (= into
+    # the ground) and hit the pad. A rock descending onto the pad from above
+    # blocks every launch direction, forcing the escape-candidate path.
+    guide = FlybyGuidance(CONFIG, MU)
+    up = SHUTTLE / np.linalg.norm(SHUTTLE)                 # local outward (Phobos-centred), not +z
+    rock = _tracks([SHUTTLE + up * 70.0], velocities=[-up * 2.5], diameters=[30.0])
+    for t in (5.0, 6.0, 7.0):
+        guide.next_wait_check = 0.0
+        guide.update(t, SHUTTLE, np.zeros(3), TARGET, rock, True, False, _clock)
+        if guide.phase != "WAIT":
+            break
+    assert guide.phase in ("AVOID", "BURN") and guide.launch_state == "EMERGENCY_LIFTOFF"
+    dv = guide.v_target                                    # commanded velocity from rest
+    elev = math.degrees(math.asin(float(np.dot(dv, up)) / np.linalg.norm(dv)))
+    assert elev >= CONFIG.v53_escape_min_elevation_deg - 1e-6
+    accel, _ = guide.update(t + 0.02, SHUTTLE, np.zeros(3), TARGET, rock, True, False, _clock)
+    assert float(np.dot(accel, up)) > 0.0                  # thrust is climbing
+
+
+def test_climb_candidates_are_all_above_the_local_horizon():
+    guide = FlybyGuidance(CONFIG, MU)
+    up = SHUTTLE / np.linalg.norm(SHUTTLE)
+    dirs = guide._climb_dirs(up)
+    assert len(dirs) == 1 + 8 * len(CONFIG.v53_escape_elevations_deg)
+    for d in dirs:
+        assert abs(np.linalg.norm(d) - 1.0) < 1e-9
+        assert math.degrees(math.asin(float(np.dot(d, up)))) >= min(CONFIG.v53_escape_elevations_deg) - 1e-9
